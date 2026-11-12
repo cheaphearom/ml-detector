@@ -1,0 +1,82 @@
+# ML anomaly detection for the POS: Loki (logs), Grafana (search and dashboards) and the detector.
+#   cp .env.example .env    (fill it in)
+#   docker compose up -d --build
+# The POS (pos-backend) ships its logs here with Grafana Alloy and calls the detector, over the Docker
+# network "pos-monitoring" that this file creates. Start this stack first. Nothing is published to the
+# internet; Grafana listens on 127.0.0.1 only.
+name: ml-detector
+
+services:
+  loki:
+    image: grafana/loki:3.5.3
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml", "-config.expand-env=true"]
+    environment:
+      LOKI_RETENTION: ${LOKI_RETENTION:-720h}
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    networks: [pos-monitoring]
+    mem_limit: 768m
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"   # this computer only: SSH tunnel or Cloudflare Access to reach it
+    depends_on: [loki]
+    networks: [pos-monitoring]
+    mem_limit: 512m
+
+  # Scores the newest 30-second window every 10 s; reachable as http://ml-detector:8000 on pos-monitoring.
+  ml-detector:
+    build: .
+    restart: unless-stopped
+    environment:
+      DETECTOR_PROFILE: ${DETECTOR_PROFILE:-pos}
+      LOG_SOURCE: loki
+      LOKI_URL: http://loki:3100
+      LOKI_QUERY: ${LOKI_QUERY:-}            # default {job="pos"}
+      LOKI_DELAY_S: ${LOKI_DELAY_S:-10}
+      MODEL_DIR: /models
+      LIVE_INTERVAL: "10"
+      DETECTOR_API_KEY: ${DETECTOR_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      NOTIFY_METHODS: ${NOTIFY_METHODS:-}
+      NOTIFY_RESOLVE_AFTER_S: ${NOTIFY_RESOLVE_AFTER_S:-60}
+      NOTIFY_MIN_WINDOWS: ${NOTIFY_MIN_WINDOWS:-}
+      NOTIFY_TIMEZONE: ${NOTIFY_TIMEZONE:-UTC}
+      TZ: UTC
+    volumes:
+      - ./models:/models
+    depends_on: [loki]
+    networks: [pos-monitoring]
+    # Training one day of logs needs about 600 MB on top of the live loop (~200 MB).
+    mem_limit: 1536m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+networks:
+  pos-monitoring:
+    name: pos-monitoring
+
+volumes:
+  loki-data:
+  grafana-data:
