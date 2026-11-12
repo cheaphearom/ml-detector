@@ -2,7 +2,9 @@
 
 Copied from the `ml-detector/` folder of the thesis project
 [cheaphearom/e-commerce](https://github.com/cheaphearom/e-commerce) at commit `7ec9f0c` (2026-11-12, `main`).
-The full history stays in that repository; this copy continues it for the POS.
+It was then developed for the POS in `monitoring/ml-detector/` of
+[cheaphearom/pos-backend](https://github.com/cheaphearom/pos-backend) and moved to this repository with that
+history (`git subtree split`). The older history stays in the e-commerce repository.
 
 ## History in the e-commerce repository
 
@@ -56,4 +58,8 @@ not copied, so those 7 tests are skipped here.
 - `notify_min_windows` / `NOTIFY_MIN_WINDOWS` (POS: 4): an ML method only notifies after alerting in that many
   windows in a row. Found in the 15-minute test: after a fault, a single leftover 500 kept PCA (trained on clean
   traffic) above its threshold for the 3 overlapping windows that contain it.
+- **Own repository with Loki** (this repository): `LOG_SOURCE=loki` reads the logs from Grafana Loki
+  (`detector/loki.py`: query_range with paging, live reading a few seconds behind, training in hour chunks);
+  `docker-compose.yml` runs Loki, Grafana (data source and a "POS logs" dashboard) and the detector; the POS ships its
+  logs with Grafana Alloy. File mode (`LOG_SOURCE=files`) is unchanged.
 

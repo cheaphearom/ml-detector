@@ -1,0 +1,7 @@
+# Development: also reach Loki and the detector from this computer (the POS API runs with `npm run dev`).
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+services:
+  loki:
+    ports: ["127.0.0.1:3100:3100"]
+  ml-detector:
+    ports: ["127.0.0.1:8000:8000"]   # detector dashboard and API: http://localhost:8000

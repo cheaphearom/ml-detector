@@ -1,0 +1,8 @@
+.git
+.env
+models
+results
+tests
+grafana
+loki
+**/__pycache__
