@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anomaly Monitor</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f4f4f2;
+    --surface: #fcfcfb;
+    --border: #e4e3df;
+    --text: #0b0b0b;
+    --text-2: #52514e;
+    --text-3: #7a7974;
+    --rules: #2a78d6;
+    --iforest: #eb6834;
+    --rforest: #1baf7a;
+    --good: #0f8a4a;
+    --good-bg: #e3f4ea;
+    --warn: #a35b00;
+    --warn-bg: #fdf0dc;
+    --bad: #c62f2f;
+    --bad-bg: #fbe5e4;
+    --neutral-bg: #ecebe7;
+    --accent: #2a78d6;
+    --shade: rgba(198, 47, 47, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121211;
+      --surface: #1a1a19;
+      --border: #2e2e2c;
+      --text: #f0efec;
+      --text-2: #c3c2b7;
+      --text-3: #8f8e86;
+      --rules: #3987e5;
+      --iforest: #d95926;
+      --rforest: #199e70;
+      --good: #4cc483;
+      --good-bg: #16301f;
+      --warn: #e5a54a;
+      --warn-bg: #33270f;
+      --bad: #f07272;
+      --bad-bg: #3a1a1a;
+      --neutral-bg: #262624;
+      --accent: #3987e5;
+      --shade: rgba(240, 114, 114, 0.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+    padding: 16px 24px; background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--text-3); font-size: 13px; }
+  header .spacer { flex: 1; }
+  main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 48px; display: grid; gap: 20px; }
+  section {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px;
+    min-width: 0;
+  }
+  section h2 { font-size: 15px; margin: 0 0 12px; }
+  section h2 .hint { font-weight: normal; color: var(--text-3); font-size: 13px; margin-left: 6px; }
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } main { padding: 16px; } header { padding: 14px 16px; } }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; white-space: nowrap;
+  }
+  .pill.good { background: var(--good-bg); color: var(--good); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .pill.neutral { background: var(--neutral-bg); color: var(--text-2); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; }
+
+  .banner {
+    background: var(--warn-bg); color: var(--warn); border-radius: 8px; padding: 10px 14px; font-weight: 600;
+  }
+
+  .services { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+  .svc { border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .svc .name { font-weight: 600; margin-bottom: 6px; }
+  .svc .fault { margin-top: 8px; font-size: 13px; }
+
+  form.fault-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  label.field { display: grid; gap: 4px; font-size: 12px; color: var(--text-2); }
+  select, input, button {
+    font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; min-height: 36px;
+  }
+  input[type=number] { width: 90px; }
+  button { cursor: pointer; font-weight: 600; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .msg { font-size: 13px; color: var(--text-2); min-height: 18px; margin-top: 8px; }
+  .msg.error { color: var(--bad); }
+
+  .chart-wrap { position: relative; }
+  svg.chart { width: 100%; height: 280px; display: block; }
+  svg.chart text { fill: var(--text-3); font-size: 11px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 14px; height: 3px; border-radius: 2px;
+    background: var(--c); vertical-align: middle; margin-right: 6px;
+  }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+    display: none; min-width: 190px; z-index: 2;
+  }
+  .tooltip .row { display: flex; justify-content: space-between; gap: 12px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text-3); font-weight: 600; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .table-scroll { overflow-x: auto; }
+
+  .explain { border-left: 3px solid var(--bad); padding: 8px 12px; background: var(--bad-bg); border-radius: 0 8px 8px 0; margin-top: 12px; }
+  .explain ul { margin: 6px 0 0; padding-left: 18px; }
+  .explain code { font-size: 12px; word-break: break-word; }
+  .alerts { display: grid; gap: 8px; max-height: 420px; overflow-y: auto; }
+  .alert { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+  .alert .top { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .muted { color: var(--text-3); }
+  .links a { color: var(--accent); margin-right: 10px; white-space: nowrap; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .actions button { min-height: 30px; padding: 4px 10px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Anomaly Monitor</h1>
+    <div class="sub">Live log-based anomaly detection for the saga microservices</div>
+  </div>
+  <div class="spacer"></div>
+  <span id="status-pill" class="pill neutral"><span class="dot"></span><span>Starting…</span></span>
+  <span id="models-pill" class="pill neutral">Models: …</span>
+  <span id="telegram-pill" class="pill neutral">Telegram: …</span>
+  <a class="pill neutral" href="http://localhost:8080/" target="_blank" rel="noopener">Open shop ↗</a>
+</header>
+
+<main>
+  <div id="experiment-banner" class="banner" hidden></div>
+
+  <section>
+    <h2>Services <span class="hint">refreshes every 5 s</span></h2>
+    <div id="services" class="services"></div>
+  </section>
+
+  <section>
+    <h2>Inject a fault <span class="hint">same presets as the experiment runner; it switches itself off after the duration</span></h2>
+    <form id="fault-form" class="fault-form">
+      <label class="field">Service
+        <select name="service">
+          <option value="order-service">order-service</option>
+          <option value="inventory-service" selected>inventory-service</option>
+          <option value="payment-service">payment-service</option>
+        </select>
+      </label>
+      <label class="field">Type
+        <select name="type">
+          <option value="DB_TIMEOUT">DB_TIMEOUT – slow DB + timeouts</option>
+          <option value="ERROR">ERROR – exceptions</option>
+          <option value="LATENCY">LATENCY – slow responses</option>
+        </select>
+      </label>
+      <label class="field">Severity
+        <select name="severity">
+          <option value="low">low</option>
+          <option value="medium" selected>medium</option>
+          <option value="high">high</option>
+        </select>
+      </label>
+      <label class="field">Duration (s)
+        <input name="durationSec" type="number" min="10" max="900" value="90">
+      </label>
+      <button class="primary" type="submit">Inject fault</button>
+      <button class="danger" type="button" id="clear-btn">Clear fault</button>
+    </form>
+    <div id="fault-msg" class="msg">Faults only show up in the logs while there is traffic: use the shop or run the load generator.</div>
+  </section>
+
+  <div class="grid-2">
+    <section>
+      <h2>Anomaly score <span class="hint">last 30 min · score ÷ threshold, above 1 = alert</span></h2>
+      <div class="legend">
+        <span style="--c: var(--rules)">Rule-based</span>
+        <span style="--c: var(--iforest)">Isolation Forest</span>
+        <span style="--c: var(--rforest)">Random Forest</span>
+      </div>
+      <div class="chart-wrap">
+        <svg id="chart" class="chart" role="img" aria-label="Anomaly score per detector over time"></svg>
+        <div id="tooltip" class="tooltip"></div>
+      </div>
+      <div id="chart-empty" class="msg">Waiting for log data…</div>
+    </section>
+
+    <section>
+      <h2>Latest window</h2>
+      <div id="latest" class="muted">Waiting for log data…</div>
+    </section>
+  </div>
+
+  <div class="grid-2">
+    <section>
+      <h2>Experiments <span class="hint">runs in the results folder</span></h2>
+      <div class="table-scroll"><table id="experiments"></table></div>
+      <div id="exp-msg" class="msg"></div>
+    </section>
+    <section>
+      <h2>Recent alerts</h2>
+      <div id="alerts" class="alerts"><div class="muted">No alerts yet.</div></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const METHODS = [
+  { key: "rules", label: "Rule-based", color: "--rules" },
+  { key: "isolation_forest", label: "Isolation Forest", color: "--iforest" },
+  { key: "random_forest", label: "Random Forest", color: "--rforest" },
+];
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const fmt = (v, d = 2) => v === null || v === undefined ? "–" : Number(v).toFixed(d);
+let experimentRunning = null;
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+  return body;
+}
+
+// ---- services ---------------------------------------------------------------------
+async function refreshServices() {
+  try {
+    const data = await api("/api/services");
+    experimentRunning = data.experiment_running;
+    const banner = $("experiment-banner");
+    banner.hidden = !experimentRunning;
+    if (experimentRunning) {
+      banner.textContent = `Experiment running (${experimentRunning.out || "?"}) – manual faults are disabled so its results stay valid.`;
+    }
+    document.querySelectorAll("#fault-form button, #clear-btn").forEach(b => b.disabled = !!experimentRunning);
+    $("telegram-pill").className = `pill ${data.telegram ? "good" : "neutral"}`;
+    $("telegram-pill").textContent = data.telegram ? "Telegram: on" : "Telegram: off";
+    $("services").innerHTML = data.services.map(s => {
+      const up = s.health === "UP";
+      const healthCls = up ? "good" : s.health === "UNREACHABLE" ? "bad" : "warn";
+      let fault = "";
+      if (s.fault) {
+        const left = Math.max(0, Math.round((new Date(s.fault.expiresAt) - Date.now()) / 1000));
+        const params = s.fault.type === "ERROR" ? `${Math.round(s.fault.errorRate * 100)} % errors`
+          : s.fault.type === "LATENCY" ? `${s.fault.latencyMs} ms`
+          : `${s.fault.latencyMs} ms, ${Math.round(s.fault.errorRate * 100)} % errors`;
+        fault = `<div class="fault"><span class="pill bad">Fault: ${esc(s.fault.type)}</span> <span class="muted">${esc(params)} · ${left} s left</span></div>`;
+      } else if (s.name !== "api-gateway") {
+        fault = `<div class="fault muted">No fault</div>`;
+      }
+      return `<div class="svc"><div class="name">${esc(s.name)}</div>
+        <span class="pill ${healthCls}"><span class="dot"></span>${esc(s.health)}</span>${fault}</div>`;
+    }).join("");
+  } catch (e) {
+    $("services").innerHTML = `<div class="msg error">${esc(e.message)}</div>`;
+  }
+}
+
+// ---- fault form ---------------------------------------------------------------------
+$("fault-form").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  const msg = $("fault-msg");
+  try {
+    await api(`/api/chaos/${f.get("service")}`, { method: "POST", body: JSON.stringify({
+      type: f.get("type"), severity: f.get("severity"), durationSec: Number(f.get("durationSec")) }) });
+    msg.className = "msg";
+    msg.textContent = `${f.get("type")} (${f.get("severity")}) injected into ${f.get("service")} for ${f.get("durationSec")} s. Detection usually follows within 10–30 s.`;
+    refreshServices();
+  } catch (e) { msg.className = "msg error"; msg.textContent = e.message; }
+});
+$("clear-btn").addEventListener("click", async () => {
+  const service = $("fault-form").service.value;
+  const msg = $("fault-msg");
+  try {
+    await api(`/api/chaos/${service}`, { method: "DELETE" });
+    msg.className = "msg"; msg.textContent = `Fault on ${service} cleared.`;
+    refreshServices();
+  } catch (e) { msg.className = "msg error"; msg.textContent = e.message; }
+});
+
+// ---- chart --------------------------------------------------------------------------
+let chartPoints = [];
+function drawChart() {
+  const svg = $("chart");
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 280;
+  const m = { l: 36, r: 12, t: 10, b: 26 };
+  const pts = chartPoints;
+  $("chart-empty").style.display = pts.length ? "none" : "block";
+  if (!pts.length) { svg.innerHTML = ""; return; }
+  const t1 = pts[pts.length - 1].t, t0 = Math.min(pts[0].t, t1 - 60);
+  const ratio = (p, k) => { const i = p.methods[k]; return i ? Math.min(i.score / i.threshold, 3) : null; };
+  let maxR = 1.5;
+  pts.forEach(p => METHODS.forEach(mm => { const r = ratio(p, mm.key); if (r !== null) maxR = Math.max(maxR, r); }));
+  maxR = Math.min(3, Math.ceil(maxR * 2) / 2);
+  const x = t => m.l + (t - t0) / (t1 - t0 || 1) * (W - m.l - m.r);
+  const y = v => H - m.b - v / maxR * (H - m.t - m.b);
+  let out = "";
+  // windows where any detector alerted
+  pts.forEach((p, i) => {
+    if (Object.values(p.methods).some(v => v.alert)) {
+      const xa = x(i ? pts[i - 1].t : p.t - 10), xb = x(p.t);
+      out += `<rect x="${xa}" y="${m.t}" width="${Math.max(1, xb - xa)}" height="${H - m.t - m.b}" fill="var(--shade)"/>`;
+    }
+  });
+  for (let v = 0; v <= maxR + 1e-9; v += 0.5) {
+    out += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}" stroke="${css("--border")}"/>`;
+    out += `<text x="${m.l - 6}" y="${y(v) + 4}" text-anchor="end">${v.toFixed(1)}</text>`;
+  }
+  out += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(1)}" y2="${y(1)}" stroke="${css("--text-2")}" stroke-dasharray="5 4"/>`;
+  out += `<text x="${m.l + 6}" y="${y(1) - 5}" text-anchor="start">alert threshold</text>`;
+  const ticks = Math.max(2, Math.min(6, Math.floor((W - m.l - m.r) / 90)));
+  const withSeconds = t1 - t0 < 15 * 60;
+  for (let i = 0; i <= ticks; i++) {
+    const t = t0 + (t1 - t0) * i / ticks;
+    const label = new Date(t * 1000).toLocaleTimeString([], withSeconds
+      ? { hour: "2-digit", minute: "2-digit", second: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+    out += `<text x="${x(t)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : i === ticks ? "end" : "middle"}">${label}</text>`;
+  }
+  METHODS.forEach(mm => {
+    let d = "", prev = null;
+    pts.forEach(p => {
+      const r = ratio(p, mm.key);
+      if (r === null) { prev = null; return; }
+      const gap = prev && p.t - prev.t > 35;
+      d += `${d && !gap ? "L" : "M"}${x(p.t).toFixed(1)},${y(r).toFixed(1)}`;
+      prev = p;
+    });
+    if (d) out += `<path d="${d}" fill="none" stroke="${css(mm.color)}" stroke-width="2" stroke-linejoin="round"/>`;
+  });
+  out += `<line id="cross" y1="${m.t}" y2="${H - m.b}" stroke="${css("--text-3")}" visibility="hidden"/>`;
+  out += `<rect id="hit" x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" fill="transparent"/>`;
+  svg.innerHTML = out;
+
+  const tip = $("tooltip"), cross = svg.querySelector("#cross");
+  const hit = svg.querySelector("#hit");
+  hit.addEventListener("mousemove", ev => {
+    const rect = svg.getBoundingClientRect();
+    const tx = t0 + (ev.clientX - rect.left - m.l) / (W - m.l - m.r) * (t1 - t0);
+    let best = pts[0];
+    pts.forEach(p => { if (Math.abs(p.t - tx) < Math.abs(best.t - tx)) best = p; });
+    const cx = x(best.t);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+    tip.innerHTML = `<div><b>${clock(best.t)}</b></div>` + METHODS.map(mm => {
+      const i = best.methods[mm.key];
+      if (!i) return `<div class="row"><span><span class="swatch" style="background:${css(mm.color)}"></span>${mm.label}</span><span class="muted">not trained</span></div>`;
+      return `<div class="row"><span><span class="swatch" style="background:${css(mm.color)}"></span>${mm.label}</span><span>${fmt(i.score / i.threshold)}${i.alert ? " · <b style='color:var(--bad)'>alert</b>" : ""}</span></div>`;
+    }).join("");
+    tip.style.display = "block";
+    const left = Math.min(cx + 12, rect.width - tip.offsetWidth - 4);
+    tip.style.left = `${Math.max(4, left)}px`;
+    tip.style.top = `${m.t + 4}px`;
+  });
+  hit.addEventListener("mouseleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); });
+}
+window.addEventListener("resize", drawChart);
+
+async function refreshHistory() {
+  try { chartPoints = (await api("/api/history?minutes=30")).points; drawChart(); } catch (e) { /* keep last chart */ }
+}
+
+// ---- latest window + status ---------------------------------------------------------------
+function explanationHtml(ex) {
+  if (!ex) return "";
+  const signals = (ex.top_signals || []).map(s => `<li>${esc(s.text)}</li>`).join("");
+  const notes = (ex.notes || []).map(n => `<li>${esc(n)}</li>`).join("");
+  const errors = (ex.example_errors || []).map(e => `<li><code>${esc(e)}</code></li>`).join("");
+  return `<div class="explain">
+    <div><b>Suspected service:</b> ${esc(ex.suspected_service || "unclear")}</div>
+    <div><b>Suspected problem:</b> ${esc(ex.suspected_problem)}</div>
+    ${signals ? `<div style="margin-top:6px"><b>Strongest signals</b><ul>${signals}</ul></div>` : ""}
+    ${notes ? `<ul>${notes}</ul>` : ""}
+    ${errors ? `<div style="margin-top:6px"><b>Example log lines</b><ul>${errors}</ul></div>` : ""}
+  </div>`;
+}
+
+async function refreshLatest() {
+  try {
+    const [d, health] = await Promise.all([api("/detect"), api("/health")]);
+    const m = health.models;
+    const trained = [m.isolation_forest && "IF", m.random_forest && "RF"].filter(Boolean);
+    $("models-pill").className = `pill ${trained.length ? "good" : "warn"}`;
+    $("models-pill").textContent = trained.length ? `Models: rules + ${trained.join(" + ")}` : "Models: rules only (not trained)";
+    const pill = $("status-pill");
+    if (d.status === "insufficient_data") {
+      pill.className = "pill neutral"; pill.innerHTML = `<span class="dot"></span><span>No data</span>`;
+      $("latest").innerHTML = `<div class="muted">${esc(d.detail)}. Send some traffic (shop or load generator).</div>`;
+      return;
+    }
+    const anomaly = d.status === "anomaly";
+    pill.className = `pill ${anomaly ? "bad" : "good"}`;
+    pill.innerHTML = `<span class="dot"></span><span>${anomaly ? "Anomaly" : "Normal"}</span>`;
+    const rows = METHODS.map(mm => {
+      const i = d.methods[mm.key];
+      if (!i) return `<tr><td><span class="swatch" style="background:${css(mm.color)}"></span>${mm.label}</td><td class="num muted" colspan="3">not trained</td></tr>`;
+      return `<tr><td><span class="swatch" style="background:${css(mm.color)}"></span>${mm.label}</td>
+        <td class="num">${fmt(i.score, 3)}</td><td class="num">${fmt(i.threshold, 3)}</td>
+        <td>${i.alert ? '<span class="pill bad">alert</span>' : '<span class="pill good">ok</span>'}</td></tr>`;
+    }).join("");
+    const f = d.features || {};
+    const feat = [
+      ["Gateway requests", f["api-gateway__http_count"], 0],
+      ["Gateway 5xx share", f["api-gateway__http_5xx_ratio"], 3],
+      ["Gateway p95 latency (ms)", f["api-gateway__latency_p95"], 0],
+      ["Errors order / inventory / payment", [f["order-service__error_count"], f["inventory-service__error_count"], f["payment-service__error_count"]].map(v => fmt(v, 0)).join(" / "), null],
+      ["Saga success ratio", f["system__saga_success_ratio"], 2],
+      ["Saga timeouts", f["system__saga_timeout"], 0],
+      ["New (unseen) log messages", f["system__unseen_templates"], 0],
+    ].map(([k, v, dgt]) => `<tr><td>${k}</td><td class="num">${dgt === null ? esc(v) : fmt(v, dgt)}</td></tr>`).join("");
+    $("latest").innerHTML = `
+      <div class="muted" style="margin-bottom:8px">Window ${esc(new Date(d.window_start).toLocaleTimeString())} – ${esc(new Date(d.window_end).toLocaleTimeString())}</div>
+      <table><tr><th>Detector</th><th class="num">Score</th><th class="num">Threshold</th><th></th></tr>${rows}</table>
+      ${explanationHtml(d.explanation)}
+      <table style="margin-top:12px">${feat}</table>`;
+  } catch (e) {
+    $("latest").innerHTML = `<div class="msg error">${esc(e.message)}</div>`;
+  }
+}
+
+// ---- alerts ---------------------------------------------------------------------------
+async function refreshAlerts() {
+  try {
+    const data = await api("/alerts?limit=30");
+    if (!data.alerts.length) { $("alerts").innerHTML = `<div class="muted">No alerts yet.</div>`; return; }
+    $("alerts").innerHTML = data.alerts.map(a => {
+      const mm = METHODS.find(x => x.key === a.method) || { label: a.method, color: "--text-3" };
+      const ex = a.explanation;
+      return `<div class="alert"><div class="top">
+          <span><span class="swatch" style="background:${css(mm.color)}"></span><b>${esc(mm.label)}</b> · score ${fmt(a.score)} (threshold ${fmt(a.threshold)})</span>
+          <span class="muted">${esc(new Date(a.window_end).toLocaleTimeString())}</span></div>
+        ${ex ? `<div class="muted">${esc(ex.suspected_service || "unclear service")} – ${esc(ex.suspected_problem)}</div>` : ""}
+        ${a.fired_rules && a.fired_rules.length ? `<div class="muted">rules: ${esc(a.fired_rules.join(", "))}</div>` : ""}
+      </div>`;
+    }).join("");
+  } catch (e) { /* keep the last list */ }
+}
+
+// ---- experiments ---------------------------------------------------------------------------
+async function refreshExperiments() {
+  try {
+    const data = await api("/api/experiments");
+    const head = `<tr><th>Run</th><th>Status</th><th class="num">Faults</th>
+      ${METHODS.map(mm => `<th class="num">${mm.label}<br>F1 · detected · delay</th>`).join("")}<th>Actions</th></tr>`;
+    if (!data.experiments.length) {
+      $("experiments").innerHTML = head + `<tr><td colspan="7" class="muted">No experiments in ${esc(data.results_root)} yet.</td></tr>`;
+      return;
+    }
+    const rows = data.experiments.map(e => {
+      const st = { running: "warn", completed: "good", incomplete: "neutral" }[e.status];
+      const ev = e.evaluation;
+      const cells = METHODS.map(mm => {
+        if (!ev || !ev.metrics[mm.key]) return `<td class="num muted">–</td>`;
+        const r = ev.metrics[mm.key], dd = ev.detection_delay[mm.key] || {};
+        return `<td class="num">${fmt(r.f1)} · ${dd.detected ?? "–"}/${dd.faults ?? "–"} · ${dd.mean_delay_s != null ? fmt(dd.mean_delay_s, 0) + " s" : "–"}</td>`;
+      }).join("");
+      const base = `/files/${encodeURIComponent(e.name)}/detector/`;
+      const links = ev ? `<div class="links">${["report.md", "timeline.png", "metrics.png", "detection_delay.png"]
+        .filter(f => ev.files.includes(f)).map(f => `<a href="${base}${f}" target="_blank" rel="noopener">${f}</a>`).join("")}</div>` : "";
+      const done = e.status !== "running";
+      return `<tr><td><b>${esc(e.name)}</b>${e.seed != null ? `<div class="muted">seed ${e.seed}</div>` : ""}</td>
+        <td><span class="pill ${st}">${esc(e.status)}</span></td><td class="num">${e.faults}</td>${cells}
+        <td><div class="actions">
+          <button data-act="evaluate" data-name="${esc(e.name)}" data-labels="${esc(e.labels_path)}" ${done ? "" : "disabled"}>${ev ? "Re-evaluate" : "Evaluate"}</button>
+          <button data-act="train" data-name="${esc(e.name)}" data-labels="${esc(e.labels_path)}" ${done ? "" : "disabled"}>Train live detector</button>
+        </div>${links}</td></tr>`;
+    }).join("");
+    $("experiments").innerHTML = head + rows;
+  } catch (e) {
+    $("experiments").innerHTML = `<tr><td class="msg error">${esc(e.message)}</td></tr>`;
+  }
+}
+
+$("experiments").addEventListener("click", async ev => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const msg = $("exp-msg");
+  const { act, name, labels } = btn.dataset;
+  document.querySelectorAll("#experiments button").forEach(b => b.disabled = true);
+  msg.className = "msg";
+  msg.textContent = act === "evaluate" ? `Evaluating ${name}… (can take a minute)` : `Training the live detector on ${name}…`;
+  try {
+    if (act === "evaluate") {
+      const out = labels.replace(/labels\.csv$/, "detector");
+      await api("/evaluate", { method: "POST", body: JSON.stringify({ labels_path: labels, out_dir: out }) });
+      msg.textContent = `${name} evaluated. Open report.md or the figures from the table.`;
+    } else {
+      const r = await api("/train", { method: "POST", body: JSON.stringify({ labels_path: labels }) });
+      msg.textContent = `Live detector trained on ${name}: ${r.windows} windows, ${r.anomalous_windows} anomalous.`;
+      refreshLatest();
+    }
+  } catch (e) { msg.className = "msg error"; msg.textContent = e.message; }
+  refreshExperiments();
+});
+
+function tick() { refreshServices(); refreshLatest(); refreshHistory(); refreshAlerts(); }
+tick();
+refreshExperiments();
+setInterval(tick, 5000);
+setInterval(refreshExperiments, 30000);
+</script>
+</body>
+</html>
