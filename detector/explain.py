@@ -147,19 +147,35 @@ def explain(window: pd.Series, baseline: dict[str, tuple[float, float]] | None =
     else:
         suspect = None
 
+    # Business events far above normal (POS: webhook failures, slow queries, failed payments …)
+    events = event_problems(window, baseline, profile)
+    if events:
+        # the event's service when no service stands out, or when its own signals are the stronger ones
+        event_service = events[0][1]
+        if suspect is None or (suspect != event_service and scores[event_service][2] >= SIGNIFICANT_Z / 2):
+            suspect = event_service
+
+    texts = {"both": "slow responses and errors (database or connection problem, like DB_TIMEOUT)",
+             "latency": "slow responses (like LATENCY)", "errors": "errors / exceptions (like ERROR)",
+             **profile.kind_texts}
+    service_kind = None
     if suspect is not None:
         lat, err, _ = scores[suspect]
         # a gateway in front of the backends sees their slowness, so use it to confirm a latency problem
         if suspect != entry and entry not in profile.backends:
             lat = max(lat, scores[entry][0])
         if lat >= SIGNIFICANT_Z and err >= SIGNIFICANT_Z:
-            kind = "slow responses and errors (database or connection problem, like DB_TIMEOUT)"
+            service_kind = texts["both"]
         elif lat >= SIGNIFICANT_Z:
-            kind = "slow responses (like LATENCY)"
-        elif err >= SIGNIFICANT_Z:
-            kind = "errors / exceptions (like ERROR)"
-        else:
-            kind = "unusual behaviour without one clear signal"
+            service_kind = texts["latency"]
+        elif err >= SIGNIFICANT_Z and not events:
+            # errors that come with a named business problem (e.g. failed webhooks) are described by it
+            service_kind = texts["errors"]
+    kinds = ([service_kind] if service_kind else []) + [text for text, _ in events]
+    if kinds:
+        kind = "; ".join(dict.fromkeys(kinds))
+    elif suspect is not None:
+        kind = "unusual behaviour without one clear signal"
     else:
         kind = "unusual combination of small changes (no single service stands out)"
 
@@ -182,14 +198,64 @@ def explain(window: pd.Series, baseline: dict[str, tuple[float, float]] | None =
         if float(window.get(system_name(event), 0.0)) > 0:
             notes.append(note)
 
-    return {
+    start, end = float(window["window_start"]), float(window["window_end"])
+    result = {
         "suspected_service": suspect,
         "suspected_problem": kind,
         "top_signals": top,
         "notes": notes,
-        "example_errors": example_errors(logs, float(window["window_start"]), float(window["window_end"]),
-                                         suspect, max_errors) if logs is not None else [],
+        "example_errors": example_errors(logs, start, end, suspect, max_errors) if logs is not None else [],
     }
+    if profile.event_problems:      # the POS: which store the failures come from
+        result["store"] = main_store(logs, start, end) if logs is not None else None
+    return result
+
+
+def event_problems(window: pd.Series, baseline: dict[str, tuple[float, float]],
+                   profile: Profile) -> list[tuple[str, str]]:
+    """(problem, service) for every profile event far above its normal level, strongest first.
+
+    An event with an "any" rule (event limit 0, e.g. webhooks given up) counts as soon as it occurs.
+    """
+    limits = dict(profile.event_limits)
+    found = []
+    for order, (event, text, service) in enumerate(profile.event_problems):
+        col = system_name(event)
+        if col not in window.index:
+            continue
+        value = float(window[col])
+        z = deviation(col, value, baseline, profile)
+        if z >= SIGNIFICANT_Z or (event in limits and value > limits[event]):
+            found.append((-z, order, text, service))
+    found.sort()
+    seen, out = set(), []
+    for _, _, text, service in found:
+        if text not in seen:
+            seen.add(text)
+            out.append((text, service))
+    return out
+
+
+def main_store(logs: pd.DataFrame, start: float, end: float, min_lines: int = 3,
+               min_share: float = 0.6) -> dict | None:
+    """The store most WARN/ERROR lines of the window come from, when one clearly dominates.
+
+    Only business events carry a store (sales, payments, stock); returns
+    {"store": name or id, "store_id", "lines", "of"} or None.
+    """
+    if logs is None or logs.empty or "store_id" not in logs:
+        return None
+    rows = logs[(logs["t"] >= start) & (logs["t"] < end) & logs["level"].isin(("WARN", "ERROR"))
+                & (logs["store_id"].astype(str) != "")]
+    if len(rows) < min_lines:
+        return None
+    counts = rows["store_id"].value_counts()
+    top_id, top_n = str(counts.index[0]), int(counts.iloc[0])
+    if top_n / len(rows) < min_share:
+        return None
+    names = logs.loc[(logs["store_id"] == top_id) & (logs["store_name"].astype(str) != ""), "store_name"]
+    return {"store": str(names.iloc[-1]) if len(names) else top_id, "store_id": top_id,
+            "lines": top_n, "of": int(len(rows))}
 
 
 def example_errors(logs: pd.DataFrame, start: float, end: float, service: str | None,

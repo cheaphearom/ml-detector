@@ -17,7 +17,8 @@ def _line(t: float, service: str, level: str, logger: str, text: str, **fields) 
 
 
 def pos_lines(duration_s: float, seed: int = 1, fault: tuple[float, float, str] | None = None) -> list[str]:
-    """Normal till traffic; ``fault`` = (start, end, kind) with kind LATENCY, ERROR or WEBHOOK."""
+    """Normal till traffic; ``fault`` = (start, end, kind) with kind LATENCY, ERROR, WEBHOOK,
+    PAYMENT (payments fail, 90 % at the Siem Reap store) or SLOWDB (slow queries, slower requests)."""
     rng = random.Random(seed)
     random.seed(seed)
     out: list[tuple[float, str]] = []
@@ -29,6 +30,11 @@ def pos_lines(duration_s: float, seed: int = 1, fault: tuple[float, float, str] 
         path, method = rng.choice([("/api/v1/products", "GET"), ("/api/v1/products/barcode/{id}", "GET"),
                                    ("/api/v1/sales", "POST"), ("/api/v1/reports/dashboard", "GET")])
         dur = rng.randint(8, 60) + (rng.randint(1800, 3500) if kind == "LATENCY" else 0)
+        if kind == "SLOWDB":
+            q = rng.randint(700, 1400)
+            dur += q
+            out.append((t + q / 1000, _line(t + q / 1000, "pos-api", "WARN", "PrismaQuery", "Slow database query",
+                                            event="db_query_slow", model="sales", action="SELECT", durationMs=q)))
         status = 201 if method == "POST" else 200
         if kind == "ERROR" and rng.random() < 0.4:
             status = 500
@@ -38,7 +44,13 @@ def pos_lines(duration_s: float, seed: int = 1, fault: tuple[float, float, str] 
                                  stack_trace="PrismaClientKnownRequestError: Timed out\n    at Prisma")))
         elif rng.random() < 0.03:
             status = 404
-        if path == "/api/v1/sales" and status < 400:
+        if path == "/api/v1/sales" and status < 400 and kind == "PAYMENT" and rng.random() < 0.8:
+            status = 400
+            store = ("s2", "Siem Reap - Pub Street") if rng.random() < 0.9 else ("s1", "Phnom Penh - Central")
+            out.append((t, _line(t, "pos-api", "WARN", "BusinessEvent", "Payment failed", event="payment_failed",
+                                 storeId=store[0], storeName=store[1], paymentMethod="KHQR", status=400,
+                                 reason="This KHQR has not been paid yet")))
+        elif path == "/api/v1/sales" and status < 400:
             if rng.random() < 0.05:
                 status = 400
                 out.append((t, _line(t, "pos-api", "WARN", "BusinessEvent", "Sale failed", event="sale_failed",

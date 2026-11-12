@@ -44,4 +44,13 @@ not copied, so those 7 tests are skipped here.
   reloads the model file); a warning when less than `MIN_TRAIN_HOURS` (24) of logs were used.
 - `GET /scores`, `last_window_end` and `notify_methods` in `/health`, optional `DETECTOR_API_KEY`
   (header `X-API-Key` on every endpoint except `/health`).
+- **POS alert wording**: profile `event_problems` name the problem from business events (webhook delivery
+  failures, slow database, payment failures, failed sales, many failed logins) and the service when none stands
+  out; `kind_texts` replace the thesis fault names (LATENCY, ERROR, DB_TIMEOUT) in POS messages. The explanation
+  names the store when most WARN/ERROR lines of the window come from one store (parsing keeps `storeId`,
+  `storeName`). Messages say "in the POS"; `NOTIFY_TIMEZONE` sets the time zone of their times.
+- **Telegram retries**: messages are queued; while Telegram is unreachable (network, 5xx, 429) they are sent
+  again after 10 s, 30 s, 1, 2, then every 5 min (at most 6 h), with a WARN log line each time; refused messages
+  (wrong token / chat) are dropped with a WARN. `/health` shows pending / sent / dropped / last error.
+  `TELEGRAM_API_URL` (tests use a local mock of the Bot API).
 

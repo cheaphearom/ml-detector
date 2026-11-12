@@ -24,7 +24,7 @@ import pandas as pd
 
 LOG_COLUMNS = [
     "ts", "t", "service", "level", "logger", "message", "template", "event",
-    "method", "path", "status", "durationMs", "has_stack", "traceId",
+    "method", "path", "status", "durationMs", "has_stack", "traceId", "store_id", "store_name",
 ]
 
 _MASKS: list[tuple[re.Pattern[str], str]] = [
@@ -115,11 +115,14 @@ def records_to_frame(records: Iterable[dict], default_service: str | None = None
             _to_float(r.get("durationMs")),
             bool(r.get("stack_trace")),
             r.get("traceId") or "",
+            str(r.get("storeId") or ""),        # POS business events name the store
+            str(r.get("storeName") or ""),
         ))
     if not rows:
         return empty_logs()
     df = pd.DataFrame(rows, columns=["ts", "service", "level", "logger", "message", "event",
-                                     "method", "path", "status", "durationMs", "has_stack", "traceId"])
+                                     "method", "path", "status", "durationMs", "has_stack", "traceId",
+                                     "store_id", "store_name"])
     df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601", errors="coerce")
     df = df.dropna(subset=["ts"])
     df["t"] = to_epoch_seconds(df["ts"])
