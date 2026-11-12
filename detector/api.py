@@ -1,10 +1,12 @@
 """FastAPI service: training, offline evaluation and live detection.
 
 Endpoints
-  POST /train      fit Isolation Forest (and Random Forest when labels exist) on the logs
+  POST /train      fit Isolation Forest, PCA (POS profile) and Random Forest (only with labels) on the logs;
+                   {"hours": 24} trains on the last 24 hours of logs
   POST /evaluate   run the full offline comparison and write the report files
   GET  /detect     score the most recent window with every available method
   GET  /alerts     alerts raised by the live detection loop
+  GET  /scores     anomaly score and threshold of every method for the recent windows
   POST /notify/test  send a test message to the configured Telegram chat
   GET  /health     liveness and model status
   GET  /           monitoring dashboard (see dashboard.py for the endpoints it uses)
@@ -15,7 +17,9 @@ explanation (suspected service, kind of problem, strongest signals, example log 
 when Telegram is configured, each incident is reported once when it starts and once when it
 is resolved.
 
-Configuration (environment variables): DETECTOR_PROFILE (ecommerce|pos), LOG_DIR, LABELS_PATH, RESULTS_DIR, MODEL_DIR, WINDOW,
+With DETECTOR_API_KEY set, every endpoint except /health needs the header ``X-API-Key``.
+
+Configuration (environment variables): DETECTOR_PROFILE (ecommerce|pos), DETECTOR_API_KEY, LOG_DIR, LABELS_PATH, RESULTS_DIR, MODEL_DIR, WINDOW,
 STEP, GRACE, LIVE_DETECTION, LIVE_INTERVAL, BUFFER_MINUTES, TAIL_FROM_START, SEED,
 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NOTIFY_METHODS, NOTIFY_RESOLVE_AFTER_S.
 """
@@ -34,7 +38,8 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -46,7 +51,9 @@ from .features import (
     add_unseen_templates, build_windows, feature_name, in_fault_mask, known_templates, label_windows, system_name,
 )
 from .profiles import get_profile
-from .models import LIVE_METHODS, RULE_METHODS, IsolationForestDetector, RandomForestDetector, RuleBasedDetector
+from .models import (
+    LIVE_METHODS, RULE_METHODS, IsolationForestDetector, PCADetector, RandomForestDetector, RuleBasedDetector,
+)
 from .notify import IncidentNotifier, TelegramSender
 from .parsing import LogTailer, empty_logs, load_experiment_meta, load_labels, load_logs
 
@@ -79,12 +86,15 @@ class Settings:
     seed: int = field(default_factory=lambda: int(os.environ.get("SEED", "42")))
     telegram_token: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", "").strip())
     telegram_chat_id: str = field(default_factory=lambda: os.environ.get("TELEGRAM_CHAT_ID", "").strip())
+    # empty = the profile's notify_methods
     notify_methods: tuple[str, ...] = field(default_factory=lambda: tuple(
-        m.strip() for m in os.environ.get("NOTIFY_METHODS", ",".join(LIVE_METHODS)).split(",") if m.strip()))
+        m.strip() for m in os.environ.get("NOTIFY_METHODS", "").split(",") if m.strip()))
     notify_resolve_after_s: float = field(
         default_factory=lambda: float(os.environ.get("NOTIFY_RESOLVE_AFTER_S", "60")))
     cors_allow_origins: tuple[str, ...] = field(default_factory=lambda: tuple(
         o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()))
+    api_key: str = field(default_factory=lambda: os.environ.get("DETECTOR_API_KEY", "").strip())
+    min_train_hours: float = field(default_factory=lambda: float(os.environ.get("MIN_TRAIN_HOURS", "24")))
 
 
 class TrainRequest(BaseModel):
@@ -92,6 +102,7 @@ class TrainRequest(BaseModel):
     labels_path: str | None = Field(None, description="defaults to LABELS_PATH; without labels all windows count as normal")
     start: str | None = None
     end: str | None = None
+    hours: float | None = Field(None, gt=0, description="train on the last N hours of logs (ignored with start)")
 
 
 class EvaluateRequest(BaseModel):
@@ -121,8 +132,11 @@ class DetectorState:
         self.profile = get_profile(settings.profile)
         self.lock = threading.RLock()
         self.rules = RuleBasedDetector(step=settings.step, profile=self.profile)
+        self.live_methods = self.profile.live_methods
         self.iforest: IsolationForestDetector | None = None
+        self.pca: PCADetector | None = None
         self.rforest: RandomForestDetector | None = None
+        self._model_mtime: float | None = None
         self.known: set[str] = set()
         self.trained_at: str | None = None
         self.training: dict = {}
@@ -139,7 +153,8 @@ class DetectorState:
             self.telegram = TelegramSender(settings.telegram_token, settings.telegram_chat_id)
         if send is None and self.telegram is not None:
             send = self.telegram.send_async
-        self.notifier = (IncidentNotifier(send, settings.notify_methods, settings.notify_resolve_after_s)
+        self.notify_methods = settings.notify_methods or self.profile.notify_methods
+        self.notifier = (IncidentNotifier(send, self.notify_methods, settings.notify_resolve_after_s)
                          if send is not None else None)
 
     # -- persistence -------------------------------------------------------------------
@@ -149,7 +164,7 @@ class DetectorState:
     def save(self) -> None:
         path = self.model_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"iforest": self.iforest, "rforest": self.rforest, "known": self.known,
+        joblib.dump({"iforest": self.iforest, "pca": self.pca, "rforest": self.rforest, "known": self.known,
                      "baseline": self.baseline, "trained_at": self.trained_at, "training": self.training,
                      "window": self.settings.window, "step": self.settings.step, "profile": self.profile.name}, path)
 
@@ -167,16 +182,41 @@ class DetectorState:
             return False
         with self.lock:
             self.iforest = bundle["iforest"]
+            self.pca = bundle.get("pca")
             self.rforest = bundle["rforest"]
             self.known = bundle["known"]
             self.baseline = bundle.get("baseline") or default_baseline(profile=self.profile)
             self.trained_at = bundle["trained_at"]
             self.training = bundle["training"]
+            self._model_mtime = path.stat().st_mtime
         return True
+
+    def reload_if_changed(self) -> None:
+        """Picks up a model trained by the CLI (``python -m detector.cli train``) in another process."""
+        path = self.model_path()
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        if self._model_mtime is not None and mtime <= self._model_mtime:
+            return
+        try:
+            if self.load():
+                log.info("loaded newly trained models from %s", path)
+            else:
+                self._model_mtime = mtime   # incompatible model: do not try again until it changes
+        except Exception:  # noqa: BLE001 - a half-written file is read again next time
+            log.exception("could not load %s", path)
 
     # -- training ----------------------------------------------------------------------
     def train(self, logs_dir: str, labels_path: str | None, start: str | None = None,
-              end: str | None = None) -> dict:
+              end: str | None = None, hours: float | None = None) -> dict:
+        """Fits the models on the logs.
+
+        Without labels (the POS) only the unsupervised models are trained, on windows where the
+        rules did not fire, so a known incident in the training period is not learned as normal.
+        Random Forest needs a labels file with faults.
+        """
         s = self.settings
         labels = load_labels(labels_path)
         meta = load_experiment_meta(labels_path)
@@ -185,6 +225,8 @@ class DetectorState:
         logs = load_logs(logs_dir, start=start_ts, end=end_ts)
         if logs.empty:
             raise ValueError(f"no log records found in {logs_dir}")
+        if hours and start_ts is None:
+            logs = logs[logs["t"] >= float(logs["t"].max()) - hours * 3600.0].reset_index(drop=True)
         windows = label_windows(build_windows(logs, s.window, s.step, profile=self.profile), labels, s.grace)
         if len(windows) < 20:
             raise ValueError(f"only {len(windows)} windows - not enough data to train")
@@ -192,30 +234,45 @@ class DetectorState:
         known = known_templates(logs, normal_logs)
         windows = add_unseen_templates(windows, logs, known)
         y = windows["label"].to_numpy()
+        has_labels = len(labels) > 0
+        # unsupervised models learn "normal": leave out labelled faults, or windows the rules flag
+        exclude = y.astype(bool) if has_labels else self.rules.predict(windows).astype(bool)
+        y_normal = exclude.astype(int)
+        if (y_normal == 0).sum() < 20:
+            raise ValueError("fewer than 20 normal windows - not enough data to train")
 
-        iforest = IsolationForestDetector(random_state=s.seed, profile=self.profile).fit(windows, y)
+        iforest = IsolationForestDetector(random_state=s.seed, profile=self.profile).fit(windows, y_normal)
+        pca = PCADetector(profile=self.profile).fit(windows, y_normal) if "pca" in self.live_methods else None
         rforest = None
-        if np.unique(y).size == 2:
+        if has_labels and np.unique(y).size == 2 and "random_forest" in self.live_methods:
             rforest = RandomForestDetector(random_state=s.seed).fit(windows, y)
+        span_h = (float(logs["t"].max()) - float(logs["t"].min())) / 3600.0
 
-        baseline = fit_baseline(windows[y == 0], profile=self.profile)
+        baseline = fit_baseline(windows[y_normal == 0], profile=self.profile)
         with self.lock:
-            self.iforest, self.rforest, self.known = iforest, rforest, known
+            self.iforest, self.pca, self.rforest, self.known = iforest, pca, rforest, known
             self.baseline = baseline or default_baseline(profile=self.profile)
             self.trained_at = dt.datetime.now(dt.timezone.utc).isoformat()
             self.training = {
                 "log_records": int(len(logs)), "windows": int(len(windows)),
                 "anomalous_windows": int(y.sum()), "faults": int(len(labels)),
                 "known_templates": len(known), "isolation_forest_threshold": iforest.threshold_,
-                "random_forest": rforest is not None,
+                "pca": pca is not None, "random_forest": rforest is not None,
+                "excluded_windows": int(exclude.sum()), "hours": round(span_h, 2),
+                "first_log": _iso(float(logs["t"].min())), "last_log": _iso(float(logs["t"].max())),
             }
+            if span_h < s.min_train_hours - 0.1:
+                self.training["warning"] = (f"only {span_h:.1f} hours of logs: train again after at least "
+                                            f"{s.min_train_hours:g} hours of normal traffic")
             self.save()
+            self._model_mtime = self.model_path().stat().st_mtime
             return {"trained_at": self.trained_at, **self.training}
 
     # -- live detection ----------------------------------------------------------------
     def poll(self) -> dict | None:
         """Reads new log lines, scores the newest window and records alerts."""
         s = self.settings
+        self.reload_if_changed()
         new = self.tailer.read_new()
         with self.lock:
             self.polls += 1
@@ -259,6 +316,10 @@ class DetectorState:
             score = float(self.iforest.score(last)[0])
             methods[IsolationForestDetector.name] = {"score": score, "threshold": self.iforest.threshold_,
                                                      "alert": bool(score > self.iforest.threshold_)}
+        if self.pca is not None:
+            score = float(self.pca.score(last)[0])
+            methods[PCADetector.name] = {"score": score, "threshold": self.pca.threshold_,
+                                         "alert": bool(score > self.pca.threshold_)}
         if self.rforest is not None:
             score = float(self.rforest.score(last)[0])
             methods[RandomForestDetector.name] = {"score": score, "threshold": self.rforest.threshold,
@@ -305,6 +366,7 @@ class DetectorState:
             return {
                 RuleBasedDetector.name: True,
                 IsolationForestDetector.name: self.iforest is not None,
+                **({PCADetector.name: self.pca is not None} if PCADetector.name in self.live_methods else {}),
                 RandomForestDetector.name: self.rforest is not None,
                 "trained_at": self.trained_at,
             }
@@ -354,13 +416,26 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_allow_origins,
                        allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
     app.state.detector = state
+
+    if settings.api_key:
+        @app.middleware("http")
+        async def require_api_key(request: Request, call_next):
+            import hmac
+            if request.url.path != "/health" and not hmac.compare_digest(
+                    request.headers.get("x-api-key", ""), settings.api_key):
+                return JSONResponse({"detail": "missing or wrong X-API-Key"}, status_code=401)
+            return await call_next(request)
+
     register_dashboard(app, state, settings)
 
     @app.get("/health")
     def health() -> dict:
+        last = state.last_detection
         return {"status": "UP", "version": __version__, "profile": state.profile.name, "live_detection": settings.live,
                 "models": state.status(), "buffered_records": int(len(state.buffer)), "polls": state.polls,
-                "telegram_notifications": state.telegram is not None}
+                "last_window_end": last["window_end"] if last else None,
+                "telegram_notifications": state.telegram is not None, "notify_methods": list(state.notify_methods),
+                "training": {k: v for k, v in state.training.items() if k in ("hours", "windows", "warning")}}
 
     @app.post("/notify/test")
     def notify_test() -> dict:
@@ -378,7 +453,7 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
         request = request or TrainRequest()
         try:
             return state.train(request.logs_dir or settings.log_dir, request.labels_path or settings.labels_path,
-                               request.start, request.end)
+                               request.start, request.end, request.hours)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -421,6 +496,18 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
         anomaly = any(m["alert"] for m in result["methods"].values())
         return {"status": "anomaly" if anomaly else "normal",
                 **{k: v for k, v in result.items() if k != "window_end_epoch"}}
+
+    @app.get("/scores")
+    def scores(minutes: float = 30.0) -> dict:
+        """Score, threshold and alert of every method per window (one point per live poll)."""
+        minutes = max(1.0, min(minutes, 120.0))
+        with state.lock:
+            points = list(state.history)
+        if points:
+            cutoff = points[-1]["t"] - minutes * 60.0
+            points = [p for p in points if p["t"] >= cutoff]
+        return {"methods": list(state.status().keys() - {"trained_at"}),
+                "points": [{"time": _iso(p["t"]), **p} for p in points]}
 
     @app.get("/alerts")
     def alerts(limit: int = 50) -> dict:

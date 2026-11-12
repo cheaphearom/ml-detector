@@ -1,6 +1,7 @@
 """Command line interface.
 
     python -m detector.cli --profile pos evaluate --logs ...   (--profile defaults to DETECTOR_PROFILE / ecommerce)
+    python -m detector.cli --profile pos train --hours 24      (live detector: train on the last 24 h of logs)
     python -m detector.cli evaluate --logs ../logs --labels ../results/labels.csv --out ../results/eval
     python -m detector.cli synth --out ./synthetic --duration-min 120 --seed 1
     python -m detector.cli aggregate --runs ../results/run_* --out ../results/summary
@@ -78,6 +79,14 @@ def main(argv: list[str] | None = None) -> int:
     ag.add_argument("--bootstrap", type=int, default=2000, help="bootstrap resamples for the confidence intervals")
     ag.add_argument("--seed", type=int, default=42, help="seed of the bootstrap")
 
+    tr = sub.add_parser("train", help="train the live detector's models on the logs (the running API reloads them)")
+    tr.add_argument("--logs", default=os.environ.get("LOG_DIR", "/logs"), help="log directory (default: LOG_DIR)")
+    tr.add_argument("--models", default=os.environ.get("MODEL_DIR", "/models"), help="model folder (default: MODEL_DIR)")
+    tr.add_argument("--hours", type=float, help="only the last N hours of logs (default: all)")
+    tr.add_argument("--start", help="ISO timestamp of the first log line to use")
+    tr.add_argument("--end", help="ISO timestamp of the last log line to use")
+    tr.add_argument("--labels", help="labels.csv with faults (enables Random Forest); the POS has none")
+
     cr = sub.add_parser("cross", help="train every method on one whole run and test it on another whole run")
     cr.add_argument("--train-run", required=True, help="run folder with logs/, labels.csv and experiment.json")
     cr.add_argument("--test-run", required=True, help="another run folder with the same layout")
@@ -108,6 +117,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.profile:
         os.environ["DETECTOR_PROFILE"] = args.profile
+    if args.command == "train":
+        from .api import DetectorState, Settings
+
+        settings = Settings(log_dir=args.logs, model_dir=args.models, live=False,
+                            labels_path=args.labels or os.environ.get("LABELS_PATH", "/nonexistent/labels.csv"))
+        try:
+            result = DetectorState(settings, send=lambda _text: None).train(
+                args.logs, settings.labels_path, args.start, args.end, args.hours)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2, default=str))
+        if result.get("warning"):
+            print(f"warning: {result['warning']}", file=sys.stderr)
+        print(f"models saved to {args.models}; the running detector loads them within one poll", file=sys.stderr)
+        return 0
     if args.command == "evaluate":
         try:
             results = evaluate_paths(args.logs, args.labels, out_dir=args.out, window=args.window, step=args.step,

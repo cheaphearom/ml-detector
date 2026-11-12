@@ -36,3 +36,12 @@ not copied, so those 7 tests are skipped here.
   only `pos-api` latency), which the reconstruction error alone does not see.
 - `--profile` option of the CLI; the dashboard's service health and fault injection are e-commerce only.
 - `tests/test_pos_profile.py` and `tests/pos_logs.py` (synthetic POS logs).
+- **Live detection for the POS**: PCA runs in the live loop; per-profile `live_methods` and `notify_methods`
+  (POS: alerts from the rules and PCA only; Isolation Forest is scored and shown but does not notify).
+  Random Forest only trains when a labels file with faults exists.
+- **Training without labels**: windows where the rules fire are left out, so a known incident is not learned as
+  normal; `{"hours": N}` on `POST /train` and `python -m detector.cli train --hours N` (the running detector
+  reloads the model file); a warning when less than `MIN_TRAIN_HOURS` (24) of logs were used.
+- `GET /scores`, `last_window_end` and `notify_methods` in `/health`, optional `DETECTOR_API_KEY`
+  (header `X-API-Key` on every endpoint except `/health`).
+
