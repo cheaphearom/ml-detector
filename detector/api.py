@@ -50,6 +50,7 @@ from .explain import default_baseline, explain, fit_baseline
 from .features import (
     add_unseen_templates, build_windows, feature_name, in_fault_mask, known_templates, label_windows, system_name,
 )
+from .loki import LokiClient, LokiError, LokiTailer, load_logs_from_loki
 from .profiles import get_profile
 from .models import (
     LIVE_METHODS, RULE_METHODS, IsolationForestDetector, PCADetector, RandomForestDetector, RuleBasedDetector,
@@ -71,6 +72,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass
 class Settings:
+    # where the logs come from: "files" (LOG_DIR) or "loki" (LOKI_URL, see loki.py)
+    log_source: str = field(default_factory=lambda: os.environ.get("LOG_SOURCE", "files").strip().lower() or "files")
+    loki_url: str = field(default_factory=lambda: os.environ.get("LOKI_URL", "").strip())
+    loki_query: str = field(default_factory=lambda: os.environ.get("LOKI_QUERY", '{job="pos"}').strip() or '{job="pos"}')
+    loki_delay_s: float = field(default_factory=lambda: float(os.environ.get("LOKI_DELAY_S") or "10"))
+    loki_org_id: str = field(default_factory=lambda: os.environ.get("LOKI_ORG_ID", "").strip())
+    loki_username: str = field(default_factory=lambda: os.environ.get("LOKI_USERNAME", "").strip())
+    loki_password: str = field(default_factory=lambda: os.environ.get("LOKI_PASSWORD", ""))
     profile: str = field(default_factory=lambda: os.environ.get("DETECTOR_PROFILE", "ecommerce"))
     log_dir: str = field(default_factory=lambda: os.environ.get("LOG_DIR", "/logs"))
     labels_path: str = field(default_factory=lambda: os.environ.get("LABELS_PATH", "/results/labels.csv"))
@@ -144,7 +153,16 @@ class DetectorState:
         self.known: set[str] = set()
         self.trained_at: str | None = None
         self.training: dict = {}
-        self.tailer = LogTailer(settings.log_dir, from_end=not settings.tail_from_start)
+        self.loki: LokiClient | None = None
+        if settings.log_source == "loki":
+            self.loki = LokiClient(settings.loki_url, settings.loki_query, settings.loki_org_id,
+                                   settings.loki_username, settings.loki_password)
+            self.tailer = LokiTailer(self.loki, settings.loki_delay_s,
+                                     backfill_s=settings.buffer_minutes * 60.0 if settings.tail_from_start else 0.0)
+        elif settings.log_source == "files":
+            self.tailer = LogTailer(settings.log_dir, from_end=not settings.tail_from_start)
+        else:
+            raise ValueError(f"LOG_SOURCE must be files or loki, not {settings.log_source!r}")
         self.buffer = empty_logs()
         self.alerts: collections.deque[dict] = collections.deque(maxlen=1000)
         self.last_alerted: dict[str, float] = {}
@@ -216,7 +234,7 @@ class DetectorState:
             log.exception("could not load %s", path)
 
     # -- training ----------------------------------------------------------------------
-    def train(self, logs_dir: str, labels_path: str | None, start: str | None = None,
+    def train(self, logs_dir: str | None, labels_path: str | None, start: str | None = None,
               end: str | None = None, hours: float | None = None) -> dict:
         """Fits the models on the logs.
 
@@ -229,9 +247,21 @@ class DetectorState:
         meta = load_experiment_meta(labels_path)
         start_ts = _ts(start) or _ts(meta.get("load_start"))
         end_ts = _ts(end) or _ts(meta.get("load_end"))
-        logs = load_logs(logs_dir, start=start_ts, end=end_ts)
+        if logs_dir is None and self.loki is not None:
+            # from Loki: the given period, or the last `hours` (default 24) up to LOKI_DELAY_S ago
+            end_ts = end_ts or pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=s.loki_delay_s)
+            start_ts = start_ts or end_ts - pd.Timedelta(hours=hours or 24.0)
+            try:
+                logs = load_logs_from_loki(self.loki, start_ts, end_ts)
+            except LokiError as e:
+                raise ValueError(str(e)) from None
+            source = f"Loki ({s.loki_query}, {start_ts:%Y-%m-%d %H:%M} – {end_ts:%H:%M} UTC)"
+        else:
+            logs_dir = logs_dir or s.log_dir
+            logs = load_logs(logs_dir, start=start_ts, end=end_ts)
+            source = logs_dir
         if logs.empty:
-            raise ValueError(f"no log records found in {logs_dir}")
+            raise ValueError(f"no log records found in {source}")
         if hours and start_ts is None:
             logs = logs[logs["t"] >= float(logs["t"].max()) - hours * 3600.0].reset_index(drop=True)
         windows = label_windows(build_windows(logs, s.window, s.step, profile=self.profile), labels, s.grace)
@@ -440,7 +470,12 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         last = state.last_detection
+        source = {"type": settings.log_source}
+        if state.loki is not None:
+            source.update(url=state.loki.url, query=state.loki.query, delay_s=settings.loki_delay_s,
+                          error=state.tailer.last_error)
         return {"status": "UP", "version": __version__, "profile": state.profile.name, "live_detection": settings.live,
+                "log_source": source,
                 "models": state.status(), "buffered_records": int(len(state.buffer)), "polls": state.polls,
                 "last_window_end": last["window_end"] if last else None,
                 "telegram_notifications": state.telegram is not None, "notify_methods": list(state.notify_methods),
@@ -465,7 +500,8 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
     def train(request: TrainRequest | None = None) -> dict:
         request = request or TrainRequest()
         try:
-            return state.train(request.logs_dir or settings.log_dir, request.labels_path or settings.labels_path,
+            return state.train(request.logs_dir or (None if state.loki else settings.log_dir),
+                               request.labels_path or settings.labels_path,
                                request.start, request.end, request.hours)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e

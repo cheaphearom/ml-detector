@@ -1,7 +1,8 @@
 """Command line interface.
 
     python -m detector.cli --profile pos evaluate --logs ...   (--profile defaults to DETECTOR_PROFILE / ecommerce)
-    python -m detector.cli --profile pos train --hours 24      (live detector: train on the last 24 h of logs)
+    python -m detector.cli --profile pos train --hours 24      (live detector: train on the last 24 h of logs,
+                                                              from Loki with LOG_SOURCE=loki, else LOG_DIR)
     python -m detector.cli evaluate --logs ../logs --labels ../results/labels.csv --out ../results/eval
     python -m detector.cli synth --out ./synthetic --duration-min 120 --seed 1
     python -m detector.cli aggregate --runs ../results/run_* --out ../results/summary
@@ -80,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     ag.add_argument("--seed", type=int, default=42, help="seed of the bootstrap")
 
     tr = sub.add_parser("train", help="train the live detector's models on the logs (the running API reloads them)")
-    tr.add_argument("--logs", default=os.environ.get("LOG_DIR", "/logs"), help="log directory (default: LOG_DIR)")
+    tr.add_argument("--logs", help="log directory (default: Loki with LOG_SOURCE=loki, else LOG_DIR)")
     tr.add_argument("--models", default=os.environ.get("MODEL_DIR", "/models"), help="model folder (default: MODEL_DIR)")
     tr.add_argument("--hours", type=float, help="only the last N hours of logs (default: all)")
     tr.add_argument("--start", help="ISO timestamp of the first log line to use")
@@ -120,11 +121,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "train":
         from .api import DetectorState, Settings
 
-        settings = Settings(log_dir=args.logs, model_dir=args.models, live=False,
+        settings = Settings(model_dir=args.models, live=False,
                             labels_path=args.labels or os.environ.get("LABELS_PATH", "/nonexistent/labels.csv"))
+        if args.logs:
+            settings.log_dir = args.logs
         try:
-            result = DetectorState(settings, send=lambda _text: None).train(
-                args.logs, settings.labels_path, args.start, args.end, args.hours)
+            state = DetectorState(settings, send=lambda _text: None)
+            logs = args.logs or (None if state.loki is not None else settings.log_dir)
+            result = state.train(logs, settings.labels_path, args.start, args.end, args.hours)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
