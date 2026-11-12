@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from detector.api import Settings, create_app
 from detector.explain import default_baseline, explain, fit_baseline, main_store
 from detector.features import build_windows
-from detector.notify import TelegramError, TelegramSender, format_detected
+from detector.notify import IncidentNotifier, TelegramError, TelegramSender, format_detected
 from detector.parsing import iter_records, records_to_frame
 from detector.profiles import get_profile
 
@@ -271,3 +271,37 @@ def test_notify_test_endpoint_with_mock_telegram(tmp_path, telegram):
         telegram.plan = [400]
         r = c.post("/notify/test")
         assert r.status_code == 502 and "chat not found" in r.json()["detail"]
+
+
+# ── no message for one stray error ─────────────────────────────────────────────────────
+def _result(t, pca=False, rules=False):
+    return {"window_end_epoch": t, "explanation": None,
+            "methods": {"rules": {"score": 2.0 if rules else 0.0, "threshold": 1.0, "alert": rules, "fired_rules": []},
+                        "pca": {"score": 9.0 if pca else 0.1, "threshold": 1.3, "alert": pca}}}
+
+
+def test_ml_alert_must_last_min_windows_before_a_message():
+    sent = []
+    n = IncidentNotifier(sent.append, ["rules", "pca"], 60, "POS", min_windows=4)
+    # one stray 500: PCA alerts in the 3 overlapping windows that contain it → no message
+    for i, alert in enumerate([True, True, True, False, False]):
+        n.update(_result(1000 + 10 * i, pca=alert))
+    assert sent == []
+    # the same window polled again does not count twice
+    for _ in range(5):
+        n.update(_result(1100, pca=True))
+    assert sent == []
+    # a real problem: the 4th window in a row sends the message
+    for i in range(1, 4):
+        assert n.update(_result(1100 + 10 * i, pca=True)) == (None if i < 3 else "opened")
+    assert len(sent) == 1 and sent[0].startswith("🚨 Anomaly detected in the POS")
+
+
+def test_rules_notify_without_extra_windows():
+    sent = []
+    n = IncidentNotifier(sent.append, ["rules", "pca"], 60, "POS", min_windows=4)
+    assert n.update(_result(1000, rules=True)) == "opened"     # the rules already waited 3 windows
+
+
+def test_pos_profile_waits_4_windows_ecommerce_1():
+    assert get_profile("pos").notify_min_windows == 4 and get_profile("ecommerce").notify_min_windows == 1

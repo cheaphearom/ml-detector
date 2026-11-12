@@ -53,4 +53,7 @@ not copied, so those 7 tests are skipped here.
   again after 10 s, 30 s, 1, 2, then every 5 min (at most 6 h), with a WARN log line each time; refused messages
   (wrong token / chat) are dropped with a WARN. `/health` shows pending / sent / dropped / last error.
   `TELEGRAM_API_URL` (tests use a local mock of the Bot API).
+- `notify_min_windows` / `NOTIFY_MIN_WINDOWS` (POS: 4): an ML method only notifies after alerting in that many
+  windows in a row. Found in the 15-minute test: after a fault, a single leftover 500 kept PCA (trained on clean
+  traffic) above its threshold for the 3 overlapping windows that contain it.
 

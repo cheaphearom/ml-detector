@@ -192,9 +192,15 @@ class IncidentNotifier:
     """Turns per-window detection results into 'detected' / 'resolved' notifications."""
 
     def __init__(self, send: Callable[[str], None], methods: Iterable[str],
-                 resolve_after_s: float = 60.0, system_name: str = "", timezone: str = "UTC"):
+                 resolve_after_s: float = 60.0, system_name: str = "", timezone: str = "UTC",
+                 min_windows: int = 1):
+        """``min_windows``: an ML method counts only after alerting in that many windows in a row
+        (rule methods already wait for their own ``consecutive`` windows)."""
         self.send = send
         self.methods = set(methods)
+        self.min_windows = max(1, int(min_windows))
+        self.runs: dict[str, int] = {}
+        self.last_window: float | None = None
         self.resolve_after_s = resolve_after_s
         self.system_name = system_name
         self.timezone = timezone
@@ -206,7 +212,13 @@ class IncidentNotifier:
     def update(self, result: dict) -> str | None:
         """Feeds one detection result; returns 'opened', 'resolved' or None."""
         now = float(result["window_end_epoch"])
-        firing = [m for m, info in result["methods"].items() if info["alert"] and m in self.methods]
+        if self.last_window is None or now > self.last_window:      # a new window (not the same one again)
+            self.last_window = now
+            for m, info in result["methods"].items():
+                self.runs[m] = self.runs.get(m, 0) + 1 if info["alert"] else 0
+        firing = [m for m, info in result["methods"].items()
+                  if info["alert"] and m in self.methods
+                  and (m.startswith("rules") or self.runs.get(m, 0) >= self.min_windows)]
         if firing:
             self.last_alert = now
             if self.open_since is None:

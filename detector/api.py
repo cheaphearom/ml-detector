@@ -21,7 +21,7 @@ With DETECTOR_API_KEY set, every endpoint except /health needs the header ``X-AP
 
 Configuration (environment variables): DETECTOR_PROFILE (ecommerce|pos), DETECTOR_API_KEY, LOG_DIR, LABELS_PATH, RESULTS_DIR, MODEL_DIR, WINDOW,
 STEP, GRACE, LIVE_DETECTION, LIVE_INTERVAL, BUFFER_MINUTES, TAIL_FROM_START, SEED,
-TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NOTIFY_METHODS, NOTIFY_RESOLVE_AFTER_S, NOTIFY_TIMEZONE, TELEGRAM_API_URL.
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NOTIFY_METHODS, NOTIFY_RESOLVE_AFTER_S, NOTIFY_TIMEZONE, NOTIFY_MIN_WINDOWS, TELEGRAM_API_URL.
 """
 from __future__ import annotations
 
@@ -91,6 +91,8 @@ class Settings:
         m.strip() for m in os.environ.get("NOTIFY_METHODS", "").split(",") if m.strip()))
     notify_resolve_after_s: float = field(
         default_factory=lambda: float(os.environ.get("NOTIFY_RESOLVE_AFTER_S") or "60"))
+    # 0 = the profile's notify_min_windows
+    notify_min_windows: int = field(default_factory=lambda: int(os.environ.get("NOTIFY_MIN_WINDOWS") or "0"))
     notify_timezone: str = field(default_factory=lambda: os.environ.get("NOTIFY_TIMEZONE", "UTC").strip() or "UTC")
     telegram_api_url: str = field(default_factory=lambda: os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org"))
     cors_allow_origins: tuple[str, ...] = field(default_factory=lambda: tuple(
@@ -158,7 +160,8 @@ class DetectorState:
             send = self.telegram.send_async
         self.notify_methods = settings.notify_methods or self.profile.notify_methods
         self.notifier = (IncidentNotifier(send, self.notify_methods, settings.notify_resolve_after_s,
-                                          self.profile.system_name, settings.notify_timezone)
+                                          self.profile.system_name, settings.notify_timezone,
+                                          settings.notify_min_windows or self.profile.notify_min_windows)
                          if send is not None else None)
 
     # -- persistence -------------------------------------------------------------------

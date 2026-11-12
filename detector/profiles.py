@@ -14,6 +14,8 @@ specific to one system, so the same code can watch another one (the POS):
     pca_t2            PCA also scores Hotelling's T² (see ``models.PCADetector``)
     live_methods      methods the live detector runs (supervised ones only when labels exist)
     notify_methods    methods whose alerts are sent to Telegram (``NOTIFY_METHODS`` overrides it)
+    notify_min_windows  an ML method notifies only after alerting in this many windows in a row (the rules have
+                      their own "consecutive"); 4 windows ≈ 40 s, so one stray error does not page anyone
     system_name       shown in notifications ("Anomaly detected in the POS"); empty for the thesis system
     kind_texts        wording of the latency / error kinds of problem (default: the thesis fault names)
     event_problems    [event, problem, service]: an event far above normal names this problem and, when no
@@ -42,6 +44,7 @@ PROFILES: dict[str, dict] = {
         "pca_t2": False,
         "live_methods": ["rules", "isolation_forest", "random_forest"],
         "notify_methods": ["rules", "isolation_forest", "random_forest"],
+        "notify_min_windows": 1,
         "system_name": "",
         "kind_texts": {},
         "event_problems": [],
@@ -74,6 +77,8 @@ PROFILES: dict[str, dict] = {
         # features moving in a POS fault it misses most of them (see ORIGIN.md).
         "live_methods": ["rules", "isolation_forest", "pca", "random_forest"],
         "notify_methods": ["rules", "pca"],
+        # One stray 500 stays in 3 overlapping windows; a real problem lasts longer.
+        "notify_min_windows": 4,
         "system_name": "POS",
         "kind_texts": {
             "both": "slow responses and errors (database or connection problem)",
@@ -126,6 +131,7 @@ class Profile:
     rules: dict = field(default_factory=dict, hash=False, compare=False)
     event_limits: tuple[tuple[str, float], ...] = ()
     pca_t2: bool = False
+    notify_min_windows: int = 1
     system_name: str = ""
     kind_texts: dict = field(default_factory=dict, hash=False, compare=False)
     event_problems: tuple[tuple[str, str, str], ...] = ()
@@ -167,6 +173,7 @@ def _build(name: str, spec: dict) -> Profile:
         symptom_events=tuple(spec.get("symptom_events", ())), rules=dict(spec.get("rules", {})),
         event_limits=tuple((k, float(v)) for k, v in spec.get("event_limits", {}).items()),
         pca_t2=bool(spec.get("pca_t2", False)),
+        notify_min_windows=int(spec.get("notify_min_windows", 1)),
         system_name=spec.get("system_name", ""),
         kind_texts=dict(spec.get("kind_texts", {})),
         event_problems=tuple((e, text, svc) for e, text, svc in spec.get("event_problems", ())),
