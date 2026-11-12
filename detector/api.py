@@ -506,7 +506,8 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
         if points:
             cutoff = points[-1]["t"] - minutes * 60.0
             points = [p for p in points if p["t"] >= cutoff]
-        return {"methods": list(state.status().keys() - {"trained_at"}),
+        available = [m for m, ready in state.status().items() if m != "trained_at" and ready]
+        return {"methods": available,
                 "points": [{"time": _iso(p["t"]), **p} for p in points]}
 
     @app.get("/alerts")
