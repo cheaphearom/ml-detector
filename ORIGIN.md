@@ -62,4 +62,7 @@ not copied, so those 7 tests are skipped here.
   (`detector/loki.py`: query_range with paging, live reading a few seconds behind, training in hour chunks);
   `docker-compose.yml` runs Loki, Grafana (data source and a "POS logs" dashboard) and the detector; the POS ships its
   logs with Grafana Alloy. File mode (`LOG_SOURCE=files`) is unchanged.
+- **System checks and self-monitoring**: `detector/watch.py` probes the POS API's `/health` and watches its
+  heartbeat lines (alerts when the API is down or its logs stop); `detector/selfmon.py` writes the detector's own
+  activity to Loki (`job="ml-detector"`) for the "ML detector" Grafana dashboard.
 

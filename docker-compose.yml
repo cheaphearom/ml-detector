@@ -58,6 +58,13 @@ services:
       NOTIFY_RESOLVE_AFTER_S: ${NOTIFY_RESOLVE_AFTER_S:-60}
       NOTIFY_MIN_WINDOWS: ${NOTIFY_MIN_WINDOWS:-}
       NOTIFY_TIMEZONE: ${NOTIFY_TIMEZONE:-UTC}
+      # system checks: is the POS API there at all, and do its logs still arrive? (empty URL = no probe)
+      POS_HEALTH_URL: ${POS_HEALTH_URL-http://api:3000/health}
+      HEALTH_CHECK_INTERVAL_S: ${HEALTH_CHECK_INTERVAL_S:-30}
+      HEALTH_FAIL_AFTER: ${HEALTH_FAIL_AFTER:-2}
+      HEARTBEAT_TIMEOUT_S: ${HEARTBEAT_TIMEOUT_S:-120}
+      # the detector's own activity to Loki for the "ML detector" dashboard (job="ml-detector")
+      SELF_MONITORING: ${SELF_MONITORING:-on}
       TZ: UTC
     volumes:
       - ./models:/models
