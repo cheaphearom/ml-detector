@@ -24,7 +24,7 @@ thesis project ([e-commerce](https://github.com/cheaphearom/e-commerce)); a *pro
 | `detector/` | the detector (Python 3.12, FastAPI, scikit-learn, pandas) |
 | `docker-compose.yml` | Loki 3.5, Grafana 12.1 and the detector; creates the Docker network `pos-monitoring` |
 | `loki/loki.yaml` | Loki, single binary, logs kept `LOKI_RETENTION` (30 days) |
-| `grafana/` | Loki data source and the "POS logs" dashboard (provisioned) |
+| `grafana/` | Loki data source and the "POS logs" and "ML detector" dashboards (provisioned) |
 | `tests/` | pytest, with synthetic POS and e-commerce logs, a mock Telegram and a mock Loki |
 
 ## Run it
@@ -80,6 +80,32 @@ Cloudflare Tunnel + Access), and set on the POS server `LOKI_PUSH_URL` (Alloy) a
   delivery failures, slow database, failed sales, many failed logins), the strongest signals against their normal
   level, real log lines, and the store when most failures come from one store.
 
+## When the API is down, or its logs stop
+
+The anomaly detection only sees what the logs say; a stopped API writes nothing. Two checks cover that, with the
+same one-message-when-it-starts, one-when-it-ends rule as the anomaly alerts:
+
+| Check | How | Message |
+|---|---|---|
+| **API probe** | `GET POS_HEALTH_URL` (`http://api:3000/health`) every 30 s; a failure is no answer, a timeout, or HTTP 503 (the POS's database or Redis down) | 🚨 "API not responding" after 2 failures in a row (≈ 1 min), with the reason (e.g. `HTTP 503 (database: fail)`); ✅ "API responding again" |
+| **Heartbeat** | the POS API writes `event=heartbeat` every 30 s, even with no customers; the detector raises when none arrives for `HEARTBEAT_TIMEOUT_S` (120 s) | 🚨 "No logs from the API": the API is down, or Alloy / Loki do not deliver its logs (the reason says when the detector cannot read Loki); ✅ "Logs arriving again" |
+
+Heartbeat lines are not part of the anomaly scores. The heartbeat check arms itself on the first heartbeat it sees,
+so a system that does not write heartbeats never raises it. Both checks appear in **Recent alerts** on the POS's
+System monitor page and in `/health` (`checks`).
+
+When the **whole server** is down, the detector is down with it: add an outside uptime monitor (e.g. UptimeRobot,
+free) on the public `https://api.yourcafe.com/health`, with its Telegram alerts.
+
+## The detector's own dashboard
+
+The detector writes its own activity to Loki (`job="ml-detector"`, never mixed with the POS logs): one line per
+10-second poll (lines read, lag, every method's score and threshold, heartbeat age, POS API response time, Telegram
+queue), plus alerts, incidents, check changes and training. Grafana's **ML detector** dashboard (folder POS) shows
+polls per minute, lines read per minute, heartbeat age, POS API health-check time, score ÷ threshold per method,
+alerts per method, incidents and checks, detection lag, Telegram, and an event list. Writing is best effort: if Loki
+does not answer, these lines are dropped and the detection goes on. `SELF_MONITORING=off` turns it off.
+
 ## Training
 
 Until it is trained only the rules run. **Train after at least 1 day of normal traffic**, on a period without
@@ -126,6 +152,10 @@ If Telegram cannot be reached the detector logs a warning, keeps running and sen
 | `NOTIFY_TIMEZONE` | UTC | |
 | `LOKI_QUERY` | `{job="pos"}` | LogQL stream selector of the system's logs |
 | `LOKI_DELAY_S` | 10 | read up to this many seconds ago (lines reach Loki a little later) |
+| `POS_HEALTH_URL` | `http://api:3000/health` | the API probe; empty = off |
+| `HEALTH_CHECK_INTERVAL_S`, `HEALTH_FAIL_AFTER` | 30, 2 | probe every 30 s; "not responding" after 2 failures |
+| `HEARTBEAT_TIMEOUT_S` | 120 | "no logs" after this many seconds without a heartbeat; 0 = off |
+| `SELF_MONITORING` | `on` | the detector's own lines to Loki (ML detector dashboard) |
 
 Without Docker or without Loki, the detector also reads log files: `LOG_SOURCE=files` (the default outside
 `docker-compose.yml`) and `LOG_DIR`. Other variables: `LOKI_URL`, `LOKI_ORG_ID`, `LOKI_USERNAME`, `LOKI_PASSWORD`,

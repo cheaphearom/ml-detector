@@ -19,7 +19,8 @@ is resolved.
 
 With DETECTOR_API_KEY set, every endpoint except /health needs the header ``X-API-Key``.
 
-Configuration (environment variables): DETECTOR_PROFILE (ecommerce|pos), DETECTOR_API_KEY, LOG_DIR, LABELS_PATH, RESULTS_DIR, MODEL_DIR, WINDOW,
+Configuration (environment variables): DETECTOR_PROFILE (ecommerce|pos), DETECTOR_API_KEY, POS_HEALTH_URL,
+HEALTH_CHECK_INTERVAL_S, HEALTH_FAIL_AFTER, HEARTBEAT_TIMEOUT_S, SELF_MONITORING, LOG_DIR, LABELS_PATH, RESULTS_DIR, MODEL_DIR, WINDOW,
 STEP, GRACE, LIVE_DETECTION, LIVE_INTERVAL, BUFFER_MINUTES, TAIL_FROM_START, SEED,
 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NOTIFY_METHODS, NOTIFY_RESOLVE_AFTER_S, NOTIFY_TIMEZONE, NOTIFY_MIN_WINDOWS, TELEGRAM_API_URL.
 """
@@ -32,6 +33,7 @@ import datetime as dt
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,7 +57,9 @@ from .profiles import get_profile
 from .models import (
     LIVE_METHODS, RULE_METHODS, IsolationForestDetector, PCADetector, RandomForestDetector, RuleBasedDetector,
 )
-from .notify import IncidentNotifier, TelegramSender
+from .notify import IncidentNotifier, TelegramSender, _clock as notify_clock
+from .selfmon import SelfMonitor
+from .watch import HealthProbe, HeartbeatWatch, message as check_message
 from .parsing import LogTailer, empty_logs, load_experiment_meta, load_labels, load_logs
 
 log = logging.getLogger("detector.api")
@@ -80,6 +84,15 @@ class Settings:
     loki_org_id: str = field(default_factory=lambda: os.environ.get("LOKI_ORG_ID", "").strip())
     loki_username: str = field(default_factory=lambda: os.environ.get("LOKI_USERNAME", "").strip())
     loki_password: str = field(default_factory=lambda: os.environ.get("LOKI_PASSWORD", ""))
+    # system checks (watch.py): the API's health endpoint, and the heartbeat lines in its logs
+    pos_health_url: str = field(default_factory=lambda: os.environ.get("POS_HEALTH_URL", "").strip())
+    health_check_interval_s: float = field(default_factory=lambda: float(os.environ.get("HEALTH_CHECK_INTERVAL_S") or "30"))
+    health_fail_after: int = field(default_factory=lambda: int(os.environ.get("HEALTH_FAIL_AFTER") or "2"))
+    heartbeat_timeout_s: float = field(default_factory=lambda: float(os.environ.get("HEARTBEAT_TIMEOUT_S") or "120"))
+    heartbeat_event: str = field(default_factory=lambda: os.environ.get("HEARTBEAT_EVENT", "heartbeat").strip() or "heartbeat")
+    # the detector's own activity to Loki (selfmon.py); default: on when reading from Loki
+    self_monitoring: str = field(default_factory=lambda: os.environ.get("SELF_MONITORING", "").strip().lower())
+    self_monitoring_job: str = field(default_factory=lambda: os.environ.get("SELF_MONITORING_JOB", "ml-detector").strip() or "ml-detector")
     profile: str = field(default_factory=lambda: os.environ.get("DETECTOR_PROFILE", "ecommerce"))
     log_dir: str = field(default_factory=lambda: os.environ.get("LOG_DIR", "/logs"))
     labels_path: str = field(default_factory=lambda: os.environ.get("LABELS_PATH", "/results/labels.csv"))
@@ -176,6 +189,16 @@ class DetectorState:
                                            api_url=settings.telegram_api_url)
         if send is None and self.telegram is not None:
             send = self.telegram.send_async
+        self.send = send
+        self.probe = (HealthProbe(settings.pos_health_url, settings.health_check_interval_s,
+                                  fail_after=settings.health_fail_after) if settings.pos_health_url else None)
+        self.heartbeat = HeartbeatWatch(settings.heartbeat_timeout_s)
+        self.selfmon: SelfMonitor | None = None
+        wants_selfmon = settings.self_monitoring in ("1", "true", "yes", "on") or (
+            settings.self_monitoring == "" and settings.log_source == "loki")
+        if wants_selfmon and settings.loki_url:
+            self.selfmon = SelfMonitor(settings.loki_url, settings.self_monitoring_job,
+                                       self.loki.headers if self.loki is not None else None)
         self.notify_methods = settings.notify_methods or self.profile.notify_methods
         self.notifier = (IncidentNotifier(send, self.notify_methods, settings.notify_resolve_after_s,
                                           self.profile.system_name, settings.notify_timezone,
@@ -262,6 +285,10 @@ class DetectorState:
             source = logs_dir
         if logs.empty:
             raise ValueError(f"no log records found in {source}")
+        # heartbeats only show that the logs arrive; like the live loop, leave them out of the features
+        logs = logs[logs["event"] != s.heartbeat_event].reset_index(drop=True)
+        if logs.empty:
+            raise ValueError(f"only heartbeat lines in {source}: no traffic to learn from")
         if hours and start_ts is None:
             logs = logs[logs["t"] >= float(logs["t"].max()) - hours * 3600.0].reset_index(drop=True)
         windows = label_windows(build_windows(logs, s.window, s.step, profile=self.profile), labels, s.grace)
@@ -303,6 +330,9 @@ class DetectorState:
                                             f"{s.min_train_hours:g} hours of normal traffic")
             self.save()
             self._model_mtime = self.model_path().stat().st_mtime
+            if self.selfmon is not None:
+                self.selfmon.event("model_trained", **{k: v for k, v in self.training.items() if not isinstance(v, (dict, list))})
+                self.selfmon.flush()
             return {"trained_at": self.trained_at, **self.training}
 
     # -- live detection ----------------------------------------------------------------
@@ -311,6 +341,13 @@ class DetectorState:
         s = self.settings
         self.reload_if_changed()
         new = self.tailer.read_new()
+        now = time.time()
+        if not new.empty:
+            # heartbeats prove the logs arrive; they are not part of the anomaly scores
+            beats = new["event"] == s.heartbeat_event
+            self.heartbeat.saw(new.loc[beats, "t"].to_numpy(), now)
+            new = new[~beats].reset_index(drop=True)
+        self._run_checks(now)
         with self.lock:
             self.polls += 1
             if not new.empty:
@@ -329,14 +366,80 @@ class DetectorState:
                     })
                 self._record_alerts(result)
                 if self.notifier is not None:
-                    self.notifier.update(result)
+                    change = self.notifier.update(result)
+                    if change and self.selfmon is not None:
+                        self.selfmon.event("incident_" + change, level="WARN" if change == "opened" else "INFO",
+                                           incident=self.notifier.incidents)
+            self._self_log(now, len(new), result)
             return result
+
+    # -- system checks (watch.py) -------------------------------------------------------
+    def _run_checks(self, now: float) -> None:
+        if self.probe is not None and self.probe.due(now):
+            change, res = self.probe.run(now)
+            if self.selfmon is not None:
+                self.selfmon.event("pos_api_check", level="INFO" if res["ok"] else "WARN", url=self.probe.url, **res)
+            if change:
+                self._check_changed("pos_api", change, res["detail"], self.probe.state.down_since, now)
+        read_error = getattr(self.tailer, "last_error", None)
+        change, reason = self.heartbeat.check(now, read_error)
+        if change:
+            self._check_changed("heartbeat", change, reason, self.heartbeat.state.down_since, now)
+
+    def _check_changed(self, kind: str, change: str, detail: str, since: float | None, now: float) -> None:
+        entry = self.profile.entry_service
+        if change == "down":
+            problem = (f"API not responding: {detail}" if kind == "pos_api" else f"no logs: {detail}")
+            with self.lock:
+                self.alerts.append({
+                    "raised_at": dt.datetime.now(dt.timezone.utc).isoformat(), "method": f"{kind}_check",
+                    "window_start": _iso(now), "window_end": _iso(now), "score": 1.0, "threshold": 1.0,
+                    "explanation": {"suspected_service": entry, "suspected_problem": problem, "top_signals": [],
+                                    "notes": [], "example_errors": []},
+                })
+            log.warning("system check %s: down (%s)", kind, detail)
+        else:
+            log.info("system check %s: back", kind)
+        if self.selfmon is not None:
+            self.selfmon.event(f"check_{change}", level="WARN" if change == "down" else "INFO", check=kind, detail=detail)
+        if self.send is not None:
+            self.send(check_message(kind, change, self.profile.system_name, detail, since,
+                                    lambda t: notify_clock(t, self.settings.notify_timezone)))
+
+    def _self_log(self, now: float, lines: int, result: dict | None) -> None:
+        if self.selfmon is None:
+            return
+        fields = {"lines_read": lines, "buffered": int(len(self.buffer)),
+                  "read_error": getattr(self.tailer, "last_error", None),
+                  "heartbeat_age_s": round(now - self.heartbeat.last_seen, 1) if self.heartbeat.last_seen else None,
+                  "incident_open": bool(self.notifier is not None and self.notifier.open_since is not None)}
+        if self.probe is not None:
+            fields.update(pos_api_ok=not self.probe.state.down and self.probe.state.last_ok is not None,
+                          pos_api_ms=self.probe.last_ms)
+        if self.telegram is not None:
+            fields.update(telegram_pending=self.telegram.pending, telegram_sent=self.telegram.sent,
+                          telegram_dropped=self.telegram.dropped)
+        if result is not None:
+            fields["window_end"] = result["window_end"]
+            fields["lag_s"] = round(now - result["window_end_epoch"], 1)
+            fields["any_alert"] = any(m["alert"] for m in result["methods"].values())
+            for m, info in result["methods"].items():
+                fields[f"score_{m}"] = round(float(info["score"]), 4)
+                fields[f"threshold_{m}"] = round(float(info["threshold"]), 4)
+                fields[f"alert_{m}"] = bool(info["alert"])
+        self.selfmon.event("poll", level="WARN" if fields.get("any_alert") else "INFO", **fields)
+        self.selfmon.flush()
 
     def _detect_latest(self) -> dict | None:
         s = self.settings
-        if self.buffer.empty:
+        # The windows follow the log time. Heartbeats move that clock on when nobody uses the system, so
+        # quiet periods become windows without activity (as in training) and incidents can be resolved.
+        clock = [float(self.buffer["t"].max())] if not self.buffer.empty else []
+        if self.heartbeat.last_heartbeat is not None:
+            clock.append(self.heartbeat.last_heartbeat)
+        if not clock:
             return None
-        t_end = float(self.buffer["t"].max())
+        t_end = max(clock)
         history = s.window + s.step * (self.rules.config.consecutive + 1)
         recent = self.buffer[self.buffer["t"] >= t_end - history - s.window]
         windows = build_windows(recent, s.window, s.step, start=t_end - history, end=t_end, profile=self.profile)
@@ -396,6 +499,10 @@ class DetectorState:
             if result.get("explanation"):
                 alert["explanation"] = result["explanation"]
             self.alerts.append(alert)
+            if self.selfmon is not None:
+                exp = result.get("explanation") or {}
+                self.selfmon.event("alert", level="WARN", method=method, score=info["score"], threshold=info["threshold"],
+                                   suspected_service=exp.get("suspected_service"), problem=exp.get("suspected_problem"))
             log.warning("anomaly alert: %s score=%.3f window_end=%s", method, info["score"], result["window_end"])
 
     def status(self) -> dict:
@@ -479,6 +586,10 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
                 "models": state.status(), "buffered_records": int(len(state.buffer)), "polls": state.polls,
                 "last_window_end": last["window_end"] if last else None,
                 "telegram_notifications": state.telegram is not None, "notify_methods": list(state.notify_methods),
+                "checks": {"pos_api": ({**state.probe.state.view(), "url": state.probe.url, "ms": state.probe.last_ms}
+                                       if state.probe is not None else None),
+                           "heartbeat": state.heartbeat.view(time.time())},
+                "self_monitoring": state.selfmon.view() if state.selfmon is not None else None,
                 "telegram": ({"pending": state.telegram.pending, "sent": state.telegram.sent,
                               "dropped": state.telegram.dropped, "last_error": state.telegram.last_error}
                              if state.telegram is not None else None),
