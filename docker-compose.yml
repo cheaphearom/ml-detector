@@ -74,6 +74,11 @@ services:
       # the POS's daily database backups (read only): too old, almost empty or much smaller than before
       BACKUP_DIR: /pos-backups
       BACKUP_MAX_AGE_H: ${BACKUP_MAX_AGE_H:-26}
+      # automatic training: the first model after a day of logs, then every week (in the background)
+      AUTO_TRAIN: ${AUTO_TRAIN:-on}
+      AUTO_TRAIN_EVERY_DAYS: ${AUTO_TRAIN_EVERY_DAYS:-7}
+      AUTO_TRAIN_AT: ${AUTO_TRAIN_AT:-04:30}
+      AUTO_TRAIN_HOURS: ${AUTO_TRAIN_HOURS:-24}
       # the detector's own activity to Loki for the "ML detector" dashboard (job="ml-detector")
       SELF_MONITORING: ${SELF_MONITORING:-on}
       TZ: UTC
