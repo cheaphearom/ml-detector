@@ -97,6 +97,23 @@ System monitor page and in `/health` (`checks`).
 When the **whole server** is down, the detector is down with it: add an outside uptime monitor (e.g. UptimeRobot,
 free) on the public `https://api.yourcafe.com/health`, with its Telegram alerts.
 
+## The public address, the server and the backups
+
+Three more checks, same rule (one message when a problem starts, one when it ends), shown in **Recent alerts** on
+the POS's System monitor page and in `/health` (`checks`):
+
+| Check | How | Message |
+|---|---|---|
+| **Public address** | `GET PUBLIC_HEALTH_URL` every 60 s: the POS's `/health` through the address the tills use (Tailscale Funnel, Cloudflare Tunnel). Empty = off | 🚨 "POS not reachable from outside" after 2 failures. Without an "API not responding" message the API is fine: the tunnel or the web app is the problem |
+| **Disk** | every 60 s, the disk holding `./models` (the server's disk) | 🚨 "Server disk almost full" above `DISK_ALERT_PCT` (85 %) twice in a row, with the command that frees space |
+| **Memory** | every 60 s, `/proc/meminfo` (a container sees the server's memory) | 🚨 "Server memory almost full" when less than `MEMORY_ALERT_PCT` (10 %) is available for 5 minutes |
+| **Backups** | every 10 min, the newest `pos-*.sql.gz` in `../pos-backend/deploy/backups` (mounted read only; `POS_BACKUP_DIR` for another place) | 🚨 "Database backup problem" when it is older than `BACKUP_MAX_AGE_H` (26 h), almost empty (a failed dump) or less than half the size of the one before |
+
+The backup check arms itself on the first backup file it sees, so a wrong folder never raises it: `/health` then
+says "waiting for a first backup". Containers are not watched one by one (that would need the Docker socket, which
+gives full control of the server): the API probe covers the API, database and Redis; the public address the web
+app and the tunnel; the heartbeat the log shipping.
+
 ## The detector's own dashboard
 
 The detector writes its own activity to Loki (`job="ml-detector"`, never mixed with the POS logs): one line per
@@ -156,6 +173,9 @@ If Telegram cannot be reached the detector logs a warning, keeps running and sen
 | `HEALTH_CHECK_INTERVAL_S`, `HEALTH_FAIL_AFTER` | 30, 2 | probe every 30 s; "not responding" after 2 failures |
 | `HEARTBEAT_TIMEOUT_S` | 120 | "no logs" after this many seconds without a heartbeat; 0 = off |
 | `SELF_MONITORING` | `on` | the detector's own lines to Loki (ML detector dashboard) |
+| `PUBLIC_HEALTH_URL`, `PUBLIC_CHECK_INTERVAL_S` | empty, 60 | the POS through its public address; empty = off |
+| `HOST_CHECKS`, `DISK_ALERT_PCT`, `MEMORY_ALERT_PCT` | `on`, 85, 10 | the server's disk and memory |
+| `POS_BACKUP_DIR`, `BACKUP_MAX_AGE_H` | `../pos-backend/deploy/backups`, 26 | the POS database backups |
 
 Without Docker or without Loki, the detector also reads log files: `LOG_SOURCE=files` (the default outside
 `docker-compose.yml`) and `LOG_DIR`. Other variables: `LOKI_URL`, `LOKI_ORG_ID`, `LOKI_USERNAME`, `LOKI_PASSWORD`,

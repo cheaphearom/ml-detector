@@ -236,3 +236,126 @@ def test_training_leaves_heartbeats_out(tmp_path):
     with TestClient(create_app(Settings(profile="pos", log_dir=str(logs), model_dir=str(tmp_path / "m"), live=False,
                                         labels_path=str(tmp_path / "none.csv")))) as c:
         assert c.post("/train", json={}).json()["log_records"] == len(lines)
+
+
+# ── the public address, the server (disk, memory) and the database backups ─────────────────
+from detector.watch import BackupWatch, HostWatch, message  # noqa: E402
+
+
+def test_public_address_probe_has_its_own_name_and_messages(server):
+    probe = HealthProbe(server.url + "/health", interval_s=0, fail_after=2, name="public_url")
+    assert probe.run(0)[0] is None and probe.state.name == "public_url"
+    server.status, server.body = 502, {"error": "tunnel"}
+    assert probe.run(10)[0] is None
+    change, res = probe.run(20)
+    assert change == "down" and res["detail"] == "HTTP 502"
+    text = message("public_url", "down", "POS", res["detail"], 20, str)
+    assert "POS not reachable from outside" in text and "tunnel" in text
+    server.status, server.body = 200, {"status": "ok"}
+    assert probe.run(30)[0] == "up"
+    assert "reachable from outside again" in message("public_url", "up", "POS", "", 20, str)
+
+
+def _meminfo(tmp_path, total_kb, avail_kb, swap_total_kb=0, swap_free_kb=0):
+    p = tmp_path / "meminfo"
+    p.write_text(f"MemTotal: {total_kb} kB\nMemFree: 100 kB\nMemAvailable: {avail_kb} kB\n"
+                 f"SwapTotal: {swap_total_kb} kB\nSwapFree: {swap_free_kb} kB\n")
+    return str(p)
+
+
+def test_disk_alerts_above_the_limit_after_two_checks(tmp_path):
+    w = HostWatch(str(tmp_path), disk_alert_pct=99.9999, memory_alert_pct=0, interval_s=0)
+    assert w.run(0) == [] and w.disk.last_detail.startswith("disk ")
+    w.disk_alert_pct = 0.0001  # any real disk is fuller than this
+    assert w.run(60) == []
+    (kind, change, detail), = w.run(120)
+    assert (kind, change) == ("disk", "down") and "% full" in detail and "free of" in detail
+    assert "docker builder prune" in message("disk", "down", "POS", detail, 120, str)
+    w.disk_alert_pct = 99.9999
+    assert w.run(180)[0][:2] == ("disk", "up")
+    assert w.view()["memory"] is None and w.view()["disk"]["status"] == "ok"
+
+
+def test_memory_alerts_only_when_low_for_five_checks(tmp_path):
+    w = HostWatch(str(tmp_path), disk_alert_pct=0, memory_alert_pct=10, interval_s=0,
+                  meminfo_path=_meminfo(tmp_path, 4_000_000, 2_000_000))
+    assert w.run(0) == [] and "50% available" in w.memory.last_detail
+    w.meminfo_path = _meminfo(tmp_path, 4_000_000, 200_000, 2_000_000, 500_000)   # 5% available, 1.4 GB swap used
+    assert all(w.run(t) == [] for t in (60, 120, 180, 240))                         # a short peak: nothing
+    (kind, change, detail), = w.run(300)
+    assert (kind, change) == ("memory", "down") and "5% available" in detail and "swap used" in detail
+    w.meminfo_path = _meminfo(tmp_path, 4_000_000, 3_000_000)
+    assert w.run(360)[0][:2] == ("memory", "up")
+
+
+def _backup(dir_, name, size, age_h, now):
+    import os
+    p = dir_ / name
+    p.write_bytes(b"x" * size)
+    os.utime(p, (now - age_h * 3600, now - age_h * 3600))
+
+
+def test_backups_arm_on_the_first_file_then_check_age_and_size(tmp_path):
+    now = 1_800_000_000.0
+    w = BackupWatch(str(tmp_path), max_age_h=26, min_bytes=1024, interval_s=0)
+    assert w.run(now) == (None, f"waiting for a first backup in {tmp_path}") and not w.armed
+    _backup(tmp_path, "pos-20260101-033000.sql.gz", 80_000, 30, now)
+    _backup(tmp_path, "pos-20260102-033000.sql.gz", 82_000, 6, now)
+    change, detail = w.run(now)
+    assert change is None and w.armed and "6 h ago" in detail and w.view()["newest"]["count"] == 2
+
+    # too old: the daily backup did not run
+    change, detail = w.run(now + 24 * 3600)
+    assert change == "down" and "30 hours old" in detail
+    assert "docker compose logs backup" in message("backup", "down", "POS", detail, now, str)
+
+    # a new one, but almost empty: the dump failed
+    _backup(tmp_path, "pos-20260103-033000.sql.gz", 20, 0, now + 24 * 3600)
+    change, detail = w.run(now + 24 * 3600 + 1)
+    assert change is None and "dump probably failed" in detail        # still down, one message only
+
+    # a good one: back
+    _backup(tmp_path, "pos-20260104-033000.sql.gz", 83_000, 0, now + 48 * 3600)
+    assert w.run(now + 48 * 3600)[0] == "up"
+
+    # much smaller than the one before
+    _backup(tmp_path, "pos-20260105-033000.sql.gz", 30_000, 0, now + 72 * 3600)
+    change, detail = w.run(now + 72 * 3600)
+    assert change == "down" and "less than half the size" in detail
+
+
+def test_live_loop_runs_the_new_checks_and_shows_them(tmp_path, server, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "pos-api.log").write_text("\n".join(pos_lines(50, seed=5)) + "\n")
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    clock = [1_800_000_000.0]
+    _backup(backups, "pos-20260101-033000.sql.gz", 50_000, 40, clock[0])          # 40 h old
+    sent = []
+    settings = Settings(profile="pos", log_dir=str(logs), model_dir=str(tmp_path / "m"), live=False,
+                        tail_from_start=True, labels_path=str(tmp_path / "none.csv"),
+                        public_health_url=server.url + "/health", public_check_interval_s=0,
+                        host_checks=True, disk_check_path=str(tmp_path), disk_alert_pct=99.9999, memory_alert_pct=0.0001,
+                        host_check_interval_s=0, backup_dir=str(backups), backup_check_interval_s=0)
+    monkeypatch.setattr(api_module.time, "time", lambda: clock[0])
+    with TestClient(create_app(settings, send=sent.append)) as c:
+        c.get("/detect")
+        assert any("Database backup problem" in m and "40 hours old" in m for m in sent)
+        server.status = 502
+        for _ in range(2):
+            clock[0] += 60
+            c.get("/detect")
+        assert sum("POS not reachable from outside" in m for m in sent) == 1
+        checks = c.get("/health").json()["checks"]
+        assert checks["public_url"]["status"] == "down" and checks["backup"]["status"] == "down"
+        assert checks["disk"]["status"] == "ok" and checks["memory"]["status"] == "ok"
+        methods = {a["method"] for a in c.get("/alerts").json()["alerts"]}
+        assert {"public_url_check", "backup_check"} <= methods
+
+
+def test_new_checks_are_off_by_default(tmp_path):
+    with TestClient(create_app(Settings(profile="pos", log_dir=str(tmp_path), model_dir=str(tmp_path / "m"),
+                                        live=False))) as c:
+        checks = c.get("/health").json()["checks"]
+        assert checks["public_url"] is None and checks["disk"] is None and checks["memory"] is None and checks["backup"] is None

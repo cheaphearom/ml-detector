@@ -63,11 +63,24 @@ services:
       HEALTH_CHECK_INTERVAL_S: ${HEALTH_CHECK_INTERVAL_S:-30}
       HEALTH_FAIL_AFTER: ${HEALTH_FAIL_AFTER:-2}
       HEARTBEAT_TIMEOUT_S: ${HEARTBEAT_TIMEOUT_S:-120}
+      # the public address the tills use, e.g. https://pos.example.ts.net/health (empty = no check)
+      PUBLIC_HEALTH_URL: ${PUBLIC_HEALTH_URL:-}
+      PUBLIC_CHECK_INTERVAL_S: ${PUBLIC_CHECK_INTERVAL_S:-60}
+      # the server: disk usage (of the disk holding ./models) and available memory
+      HOST_CHECKS: ${HOST_CHECKS:-on}
+      DISK_CHECK_PATH: /models
+      DISK_ALERT_PCT: ${DISK_ALERT_PCT:-85}
+      MEMORY_ALERT_PCT: ${MEMORY_ALERT_PCT:-10}
+      # the POS's daily database backups (read only): too old, almost empty or much smaller than before
+      BACKUP_DIR: /pos-backups
+      BACKUP_MAX_AGE_H: ${BACKUP_MAX_AGE_H:-26}
       # the detector's own activity to Loki for the "ML detector" dashboard (job="ml-detector")
       SELF_MONITORING: ${SELF_MONITORING:-on}
       TZ: UTC
     volumes:
       - ./models:/models
+      # pos-backend/deploy/backups next to this folder (read only); another place: POS_BACKUP_DIR in .env
+      - ${POS_BACKUP_DIR:-../pos-backend/deploy/backups}:/pos-backups:ro
     depends_on: [loki]
     networks: [pos-monitoring]
     # Training one day of logs needs about 600 MB on top of the live loop (~200 MB).
