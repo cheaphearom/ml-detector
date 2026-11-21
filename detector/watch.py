@@ -14,13 +14,26 @@ arriving, there is nothing to score and the detector would stay silent. Two chec
 :class:`CheckState` turns a stream of ok / failing results into exactly one "down" and one "back"
 message, after ``fail_after`` failures in a row.
 
+Three more checks look at what the tills and the owner depend on beyond the API itself:
+
+* **the public address** (:class:`HealthProbe` named ``public_url``): the same ``/health``, but through the address the
+  tills use (Tailscale Funnel, Cloudflare Tunnel...). The API can be fine while the tunnel or the web app is not.
+* **the server** (:class:`HostWatch`): disk usage of the folder ``disk_path`` (the server's disk) and available
+  memory (``/proc/meminfo``: in a container it shows the server's memory).
+* **the database backups** (:class:`BackupWatch`): the newest ``pos-*.sql.gz`` in the POS backup folder must be
+  recent and not suspiciously small. Armed once a first backup file is seen.
+
 Configuration (environment variables): POS_HEALTH_URL (empty = no probe), HEALTH_CHECK_INTERVAL_S (30),
-HEALTH_FAIL_AFTER (2), HEARTBEAT_TIMEOUT_S (120, 0 = off), HEARTBEAT_EVENT (heartbeat).
+HEALTH_FAIL_AFTER (2), HEARTBEAT_TIMEOUT_S (120, 0 = off), HEARTBEAT_EVENT (heartbeat), PUBLIC_HEALTH_URL (empty = off),
+PUBLIC_CHECK_INTERVAL_S (60), HOST_CHECKS (off; on in docker-compose.yml), DISK_CHECK_PATH, DISK_ALERT_PCT (85),
+MEMORY_ALERT_PCT (10), BACKUP_DIR (empty = off), BACKUP_MAX_AGE_H (26), BACKUP_MIN_KB (1).
 """
 from __future__ import annotations
 
 import datetime as dt
+import glob
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -82,12 +95,13 @@ class HealthProbe:
     interval_s: float = 30.0
     timeout_s: float = 5.0
     fail_after: int = 2
+    name: str = "pos_api"
     state: CheckState = field(init=False)
     last_ms: float | None = None
     _next: float = 0.0
 
     def __post_init__(self):
-        self.state = CheckState("pos_api", self.fail_after)
+        self.state = CheckState(self.name, self.fail_after)
 
     def due(self, now: float) -> bool:
         return now >= self._next
@@ -167,6 +181,155 @@ class HeartbeatWatch:
         return v
 
 
+def _size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def read_meminfo(path: str = "/proc/meminfo") -> dict[str, int]:
+    """MemTotal, MemAvailable, SwapTotal, SwapFree ... in bytes."""
+    out: dict[str, int] = {}
+    with open(path) as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts and parts[0].isdigit():
+                out[key.strip()] = int(parts[0]) * (1024 if len(parts) > 1 and parts[1].lower() == "kb" else 1)
+    return out
+
+
+@dataclass
+class HostWatch:
+    """The server's disk (the file system holding ``disk_path``) and memory, every ``interval_s`` seconds.
+
+    Disk: "down" when more than ``disk_alert_pct`` % is used (2 checks in a row). Memory: "down" when less than
+    ``memory_alert_pct`` % is available for ``memory_fail_after`` checks in a row (5 minutes by default), so a short
+    peak (a build, a training) does not page anyone.
+    """
+
+    disk_path: str = "/models"
+    disk_alert_pct: float = 85.0
+    memory_alert_pct: float = 10.0
+    interval_s: float = 60.0
+    memory_fail_after: int = 5
+    meminfo_path: str = "/proc/meminfo"
+    disk: CheckState = field(init=False)
+    memory: CheckState = field(init=False)
+    last: dict = field(default_factory=dict)
+    _next: float = 0.0
+
+    def __post_init__(self):
+        self.disk = CheckState("disk", fail_after=2)
+        self.memory = CheckState("memory", fail_after=self.memory_fail_after)
+
+    def due(self, now: float) -> bool:
+        return now >= self._next
+
+    def run(self, now: float) -> list[tuple[str, str, str]]:
+        """Checks once; returns [(kind, transition, detail)] for the checks that changed."""
+        self._next = now + self.interval_s
+        changes: list[tuple[str, str, str]] = []
+        if self.disk_alert_pct > 0:
+            try:
+                st = os.statvfs(self.disk_path)
+                total, free = st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
+                pct = round((total - free) / total * 100.0, 1) if total else 0.0
+                detail = f"disk {pct:.0f}% full ({_size(free)} free of {_size(total)})"
+                self.last.update(disk_used_pct=pct, disk_free_bytes=free, disk_total_bytes=total)
+                change = self.disk.update(pct <= self.disk_alert_pct, now, detail)
+            except OSError as e:
+                change = None
+                self.disk.last_detail = f"cannot read the disk usage of {self.disk_path}: {e}"
+            if change:
+                changes.append(("disk", change, self.disk.last_detail))
+        if self.memory_alert_pct > 0:
+            try:
+                m = read_meminfo(self.meminfo_path)
+                total, avail = m.get("MemTotal", 0), m.get("MemAvailable", m.get("MemFree", 0))
+                swap = m.get("SwapTotal", 0) - m.get("SwapFree", 0)
+                pct = round(avail / total * 100.0, 1) if total else 100.0
+                detail = (f"memory {pct:.0f}% available ({_size(avail)} of {_size(total)})"
+                          + (f", swap used {_size(swap)}" if swap > 0 else ""))
+                self.last.update(memory_available_pct=pct, memory_available_bytes=avail, swap_used_bytes=swap)
+                change = self.memory.update(pct >= self.memory_alert_pct, now, detail)
+            except (OSError, ValueError) as e:
+                change = None
+                self.memory.last_detail = f"cannot read the memory: {e}"
+            if change:
+                changes.append(("memory", change, self.memory.last_detail))
+        return changes
+
+    def view(self) -> dict:
+        return {"disk": {**self.disk.view(), "path": self.disk_path, "alert_pct": self.disk_alert_pct,
+                         "used_pct": self.last.get("disk_used_pct")} if self.disk_alert_pct > 0 else None,
+                "memory": {**self.memory.view(), "alert_pct": self.memory_alert_pct,
+                           "available_pct": self.last.get("memory_available_pct")} if self.memory_alert_pct > 0 else None}
+
+
+@dataclass
+class BackupWatch:
+    """The newest database backup (``pattern`` in ``directory``) must be younger than ``max_age_h`` hours,
+    at least ``min_bytes`` big, and not less than half the size of the one before (a failed or cut dump).
+
+    Armed once a first backup file is seen, so a server without backups (or a wrong folder) never raises it;
+    if every file then disappears, that is a problem.
+    """
+
+    directory: str
+    max_age_h: float = 26.0
+    min_bytes: int = 1024
+    pattern: str = "pos-*.sql.gz"
+    interval_s: float = 600.0
+    state: CheckState = field(init=False)
+    armed: bool = False
+    newest: dict | None = None
+    _next: float = 0.0
+
+    def __post_init__(self):
+        self.state = CheckState("backup", fail_after=1)
+
+    def due(self, now: float) -> bool:
+        return now >= self._next
+
+    def run(self, now: float) -> tuple[str | None, str]:
+        """Checks once; returns (transition, detail)."""
+        self._next = now + self.interval_s
+        files = []
+        for path in glob.glob(os.path.join(self.directory, self.pattern)):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, os.path.basename(path)))
+        files.sort(reverse=True)
+        if not files:
+            if not self.armed:
+                self.state.last_detail = f"waiting for a first backup in {self.directory}"
+                return None, self.state.last_detail
+            return self.state.update(False, now, f"no backup file left in {self.directory}"), self.state.last_detail
+        self.armed = True
+        mtime, size, name = files[0]
+        age_h = (now - mtime) / 3600.0
+        self.newest = {"file": name, "at": _clock(mtime), "bytes": size, "age_h": round(age_h, 1), "count": len(files)}
+        problems = []
+        if age_h > self.max_age_h:
+            problems.append(f"the last backup is {age_h:.0f} hours old ({name})")
+        if size < self.min_bytes:
+            problems.append(f"the last backup ({name}) is only {_size(size)}: the database dump probably failed")
+        elif len(files) > 1 and files[1][1] >= 4 * self.min_bytes and size < files[1][1] / 2:
+            problems.append(f"the last backup ({name}, {_size(size)}) is less than half the size of the one before "
+                            f"({_size(files[1][1])}): check it")
+        detail = "; ".join(problems) if problems else f"last backup {name}, {_size(size)}, {age_h:.0f} h ago"
+        return self.state.update(not problems, now, detail), detail
+
+    def view(self) -> dict:
+        return {**self.state.view(), "armed": self.armed, "directory": self.directory, "max_age_h": self.max_age_h,
+                "newest": self.newest}
+
+
 def message(kind: str, transition: str, system: str, detail: str, since: float | None,
             clock: Callable[[float], str]) -> str:
     """Telegram text for a check that went down or came back."""
@@ -178,7 +341,32 @@ def message(kind: str, transition: str, system: str, detail: str, since: float |
                     f"Tills and the web app may not work. The anomaly detection cannot see a stopped API.")
         minutes = f" (down about {(time.time() - since) / 60:.0f} min)" if since else ""
         return f"✅ API responding again{where}{minutes}\nTime: {clock(time.time())}"
+    now = clock(time.time())
+    minutes = f" (about {(time.time() - since) / 60:.0f} min)" if since else ""
+    if kind == "public_url":
+        if transition == "down":
+            return (f"🚨 POS not reachable from outside{where}\nTime: {now}\n\n"
+                    f"The public address did not answer twice in a row: {detail or 'no answer'}.\n"
+                    f"Tills and phones cannot reach the POS. If no \"API not responding\" message came, the API itself "
+                    f"is fine: check the tunnel (Tailscale Funnel / Cloudflare) and the web app.")
+        return f"✅ POS reachable from outside again{where}{minutes}\nTime: {now}"
+    if kind == "disk":
+        if transition == "down":
+            return (f"🚨 Server disk almost full{where}\nTime: {now}\n\n{detail}.\n"
+                    f"When it is full the database and the POS stop. Free space on the server (removes only old build "
+                    f"leftovers): docker builder prune -f && docker image prune -f")
+        return f"✅ Server disk OK again{where}: {detail}\nTime: {now}"
+    if kind == "memory":
+        if transition == "down":
+            return (f"🚨 Server memory almost full{where}\nTime: {now}\n\n{detail}, for several minutes.\n"
+                    f"The POS may become slow, or a container may be stopped.")
+        return f"✅ Server memory OK again{where}: {detail}\nTime: {now}"
+    if kind == "backup":
+        if transition == "down":
+            return (f"🚨 Database backup problem{where}\nTime: {now}\n\n{detail}.\n"
+                    f"Check on the server: cd ~/pos-backend/deploy && docker compose logs backup --tail 20")
+        return f"✅ Database backups OK again{where}: {detail}\nTime: {now}"
     if transition == "down":
-        return (f"🚨 No logs from the API{where}\nTime: {clock(time.time())}\n\n{detail}.\n"
+        return (f"🚨 No logs from the API{where}\nTime: {now}\n\n{detail}.\n"
                 f"Until logs arrive again, the anomaly detection is blind.")
-    return f"✅ Logs arriving again{where}\nTime: {clock(time.time())}"
+    return f"✅ Logs arriving again{where}\nTime: {now}"

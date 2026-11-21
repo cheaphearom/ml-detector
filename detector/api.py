@@ -59,7 +59,8 @@ from .models import (
 )
 from .notify import IncidentNotifier, TelegramSender, _clock as notify_clock
 from .selfmon import SelfMonitor
-from .watch import HealthProbe, HeartbeatWatch, message as check_message
+from .autotrain import AutoTrainer, IncidentLog, skipped_message, trained_message
+from .watch import BackupWatch, HealthProbe, HeartbeatWatch, HostWatch, message as check_message
 from .parsing import LogTailer, empty_logs, load_experiment_meta, load_labels, load_logs
 
 log = logging.getLogger("detector.api")
@@ -90,6 +91,26 @@ class Settings:
     health_fail_after: int = field(default_factory=lambda: int(os.environ.get("HEALTH_FAIL_AFTER") or "2"))
     heartbeat_timeout_s: float = field(default_factory=lambda: float(os.environ.get("HEARTBEAT_TIMEOUT_S") or "120"))
     heartbeat_event: str = field(default_factory=lambda: os.environ.get("HEARTBEAT_EVENT", "heartbeat").strip() or "heartbeat")
+    # the public address the tills use (Tailscale Funnel / Cloudflare), e.g. https://pos.example.ts.net/health
+    public_health_url: str = field(default_factory=lambda: os.environ.get("PUBLIC_HEALTH_URL", "").strip())
+    public_check_interval_s: float = field(default_factory=lambda: float(os.environ.get("PUBLIC_CHECK_INTERVAL_S") or "60"))
+    # the server: disk usage of DISK_CHECK_PATH's file system, and available memory (/proc/meminfo)
+    host_checks: bool = field(default_factory=lambda: _env_bool("HOST_CHECKS", False))
+    disk_check_path: str = field(default_factory=lambda: os.environ.get("DISK_CHECK_PATH", "").strip())
+    disk_alert_pct: float = field(default_factory=lambda: float(os.environ.get("DISK_ALERT_PCT") or "85"))
+    memory_alert_pct: float = field(default_factory=lambda: float(os.environ.get("MEMORY_ALERT_PCT") or "10"))
+    host_check_interval_s: float = field(default_factory=lambda: float(os.environ.get("HOST_CHECK_INTERVAL_S") or "60"))
+    # the POS database backups (pos-*.sql.gz): empty = off
+    backup_dir: str = field(default_factory=lambda: os.environ.get("BACKUP_DIR", "").strip())
+    backup_max_age_h: float = field(default_factory=lambda: float(os.environ.get("BACKUP_MAX_AGE_H") or "26"))
+    backup_min_kb: float = field(default_factory=lambda: float(os.environ.get("BACKUP_MIN_KB") or "1"))
+    backup_check_interval_s: float = field(default_factory=lambda: float(os.environ.get("BACKUP_CHECK_INTERVAL_S") or "600"))
+    # automatic training (autotrain.py): the first model after a day of logs, then every AUTO_TRAIN_EVERY_DAYS
+    auto_train: bool = field(default_factory=lambda: _env_bool("AUTO_TRAIN", False))
+    auto_train_every_days: float = field(default_factory=lambda: float(os.environ.get("AUTO_TRAIN_EVERY_DAYS") or "7"))
+    auto_train_at: str = field(default_factory=lambda: os.environ.get("AUTO_TRAIN_AT", "04:30").strip() or "04:30")
+    auto_train_hours: float = field(default_factory=lambda: float(os.environ.get("AUTO_TRAIN_HOURS") or "24"))
+    auto_train_max_unusual: float = field(default_factory=lambda: float(os.environ.get("AUTO_TRAIN_MAX_UNUSUAL") or "0.2"))
     # the detector's own activity to Loki (selfmon.py); default: on when reading from Loki
     self_monitoring: str = field(default_factory=lambda: os.environ.get("SELF_MONITORING", "").strip().lower())
     self_monitoring_job: str = field(default_factory=lambda: os.environ.get("SELF_MONITORING_JOB", "ml-detector").strip() or "ml-detector")
@@ -193,6 +214,18 @@ class DetectorState:
         self.probe = (HealthProbe(settings.pos_health_url, settings.health_check_interval_s,
                                   fail_after=settings.health_fail_after) if settings.pos_health_url else None)
         self.heartbeat = HeartbeatWatch(settings.heartbeat_timeout_s)
+        self.public_probe = (HealthProbe(settings.public_health_url, settings.public_check_interval_s, timeout_s=10.0,
+                                         fail_after=2, name="public_url") if settings.public_health_url else None)
+        self.host = (HostWatch(settings.disk_check_path or settings.model_dir, settings.disk_alert_pct,
+                               settings.memory_alert_pct, settings.host_check_interval_s)
+                     if settings.host_checks else None)
+        # periods the detector alerted on: left out of every training (also after a restart)
+        self.incident_log = IncidentLog(str(Path(settings.model_dir) / "incidents.json"))
+        self.autotrain = (AutoTrainer(settings.auto_train_every_days, settings.auto_train_at, settings.auto_train_hours,
+                                      settings.notify_timezone, settings.auto_train_max_unusual)
+                          if settings.auto_train else None)
+        self.backup = (BackupWatch(settings.backup_dir, settings.backup_max_age_h, int(settings.backup_min_kb * 1024),
+                                   interval_s=settings.backup_check_interval_s) if settings.backup_dir else None)
         self.selfmon: SelfMonitor | None = None
         wants_selfmon = settings.self_monitoring in ("1", "true", "yes", "on") or (
             settings.self_monitoring == "" and settings.log_source == "loki")
@@ -258,12 +291,17 @@ class DetectorState:
 
     # -- training ----------------------------------------------------------------------
     def train(self, logs_dir: str | None, labels_path: str | None, start: str | None = None,
-              end: str | None = None, hours: float | None = None) -> dict:
+              end: str | None = None, hours: float | None = None, exclude_periods: list | None = None,
+              max_unusual: float | None = None, min_hours: float | None = None) -> dict:
         """Fits the models on the logs.
 
         Without labels (the POS) only the unsupervised models are trained, on windows where the
         rules did not fire, so a known incident in the training period is not learned as normal.
         Random Forest needs a labels file with faults.
+
+        ``exclude_periods`` (epoch start, end): also leave out these windows (periods the detector alerted on).
+        ``max_unusual``: refuse to train when a larger share of the windows was left out (not a normal period).
+        ``min_hours``: refuse to train on fewer hours of logs.
         """
         s = self.settings
         labels = load_labels(labels_path)
@@ -291,6 +329,9 @@ class DetectorState:
             raise ValueError(f"only heartbeat lines in {source}: no traffic to learn from")
         if hours and start_ts is None:
             logs = logs[logs["t"] >= float(logs["t"].max()) - hours * 3600.0].reset_index(drop=True)
+        span = (float(logs["t"].max()) - float(logs["t"].min())) / 3600.0
+        if min_hours and span < min_hours:
+            raise ValueError(f"only {span:.1f} hours of logs so far; training needs at least {min_hours:g}")
         windows = label_windows(build_windows(logs, s.window, s.step, profile=self.profile), labels, s.grace)
         if len(windows) < 20:
             raise ValueError(f"only {len(windows)} windows - not enough data to train")
@@ -301,6 +342,13 @@ class DetectorState:
         has_labels = len(labels) > 0
         # unsupervised models learn "normal": leave out labelled faults, or windows the rules flag
         exclude = y.astype(bool) if has_labels else self.rules.predict(windows).astype(bool)
+        if exclude_periods:
+            ws, we = windows["window_start"].to_numpy(dtype=float), windows["window_end"].to_numpy(dtype=float)
+            for a, b in exclude_periods:
+                exclude |= (ws < b) & (we > a)
+        if max_unusual is not None and len(exclude) and exclude.mean() > max_unusual:
+            raise ValueError(f"{exclude.mean():.0%} of the period looked unusual (alerts or rules firing), more than "
+                             f"{max_unusual:.0%}: not normal enough to learn from")
         y_normal = exclude.astype(int)
         if (y_normal == 0).sum() < 20:
             raise ValueError("fewer than 20 normal windows - not enough data to train")
@@ -365,13 +413,54 @@ class DetectorState:
                                     for m, i in result["methods"].items()},
                     })
                 self._record_alerts(result)
+                if any(info["alert"] and m in self.notify_methods for m, info in result["methods"].items()):
+                    self.incident_log.add(result["window_end_epoch"] - s.window, result["window_end_epoch"])
                 if self.notifier is not None:
                     change = self.notifier.update(result)
                     if change and self.selfmon is not None:
                         self.selfmon.event("incident_" + change, level="WARN" if change == "opened" else "INFO",
                                            incident=self.notifier.incidents)
             self._self_log(now, len(new), result)
-            return result
+        self._maybe_auto_train(now)
+        return result
+
+    # -- automatic training (autotrain.py) -----------------------------------------------
+    def _maybe_auto_train(self, now: float) -> None:
+        a = self.autotrain
+        if a is None:
+            return
+        last = self.incident_log.periods[-1][1] if self.incident_log.periods else None
+        incident_open = (self.notifier is not None and self.notifier.open_since is not None) or (
+            last is not None and now - last < 600)
+        if not a.due(now, self.trained_at, incident_open):
+            return
+        a.running = True
+        threading.Thread(target=self._auto_train_run, args=(self.trained_at is None,), daemon=True,
+                         name="auto-train").start()
+
+    def _auto_train_run(self, first: bool) -> None:
+        a, s = self.autotrain, self.settings
+        local_now = dt.datetime.now(dt.timezone.utc).isoformat()
+        try:
+            result = self.train(None, s.labels_path, hours=a.hours, exclude_periods=list(self.incident_log.periods),
+                                max_unusual=a.max_unusual, min_hours=min(a.hours, s.min_train_hours) - 0.5)
+            a.last = {"at": local_now, "ok": True, "first": first, "windows": result.get("windows"),
+                      "excluded_windows": result.get("excluded_windows"), "hours": result.get("hours")}
+            log.info("automatic training done: %s windows", result.get("windows"))
+            if self.send is not None:
+                self.send(trained_message(result, first, self.profile.system_name, a.next_try(time.time(), self.trained_at)))
+        except Exception as e:  # noqa: BLE001 - never stop the live loop
+            reason = str(e) or type(e).__name__
+            a.last = {"at": local_now, "ok": False, "first": first, "message": reason}
+            log.warning("automatic training skipped: %s", reason)
+            # before the first model, "not enough hours yet" is expected: no message every day
+            if self.send is not None and not (first and "hours of logs so far" in reason):
+                self.send(skipped_message(reason, self.profile.system_name, a.next_try(time.time(), self.trained_at)))
+        finally:
+            a.running = False
+            if self.selfmon is not None:
+                self.selfmon.event("auto_train", level="INFO" if a.last.get("ok") else "WARN",
+                                   **{k: v for k, v in a.last.items() if not isinstance(v, (dict, list))})
 
     # -- system checks (watch.py) -------------------------------------------------------
     def _run_checks(self, now: float) -> None:
@@ -385,11 +474,29 @@ class DetectorState:
         change, reason = self.heartbeat.check(now, read_error)
         if change:
             self._check_changed("heartbeat", change, reason, self.heartbeat.state.down_since, now)
+        if self.public_probe is not None and self.public_probe.due(now):
+            change, res = self.public_probe.run(now)
+            if self.selfmon is not None:
+                self.selfmon.event("public_url_check", level="INFO" if res["ok"] else "WARN", url=self.public_probe.url, **res)
+            if change:
+                self._check_changed("public_url", change, res["detail"], self.public_probe.state.down_since, now)
+        if self.host is not None and self.host.due(now):
+            for kind, change, detail in self.host.run(now):
+                state = self.host.disk if kind == "disk" else self.host.memory
+                self._check_changed(kind, change, detail, state.down_since, now)
+            if self.selfmon is not None:
+                self.selfmon.event("host_check", **self.host.last)
+        if self.backup is not None and self.backup.due(now):
+            change, detail = self.backup.run(now)
+            if change:
+                self._check_changed("backup", change, detail, self.backup.state.down_since, now)
 
     def _check_changed(self, kind: str, change: str, detail: str, since: float | None, now: float) -> None:
         entry = self.profile.entry_service
         if change == "down":
-            problem = (f"API not responding: {detail}" if kind == "pos_api" else f"no logs: {detail}")
+            problem = {"pos_api": f"API not responding: {detail}", "heartbeat": f"no logs: {detail}",
+                       "public_url": f"POS not reachable from outside: {detail}", "disk": f"server disk almost full: {detail}",
+                       "memory": f"server memory almost full: {detail}", "backup": f"database backup problem: {detail}"}.get(kind, detail)
             with self.lock:
                 self.alerts.append({
                     "raised_at": dt.datetime.now(dt.timezone.utc).isoformat(), "method": f"{kind}_check",
@@ -588,7 +695,12 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
                 "telegram_notifications": state.telegram is not None, "notify_methods": list(state.notify_methods),
                 "checks": {"pos_api": ({**state.probe.state.view(), "url": state.probe.url, "ms": state.probe.last_ms}
                                        if state.probe is not None else None),
-                           "heartbeat": state.heartbeat.view(time.time())},
+                           "heartbeat": state.heartbeat.view(time.time()),
+                           "public_url": ({**state.public_probe.state.view(), "url": state.public_probe.url,
+                                           "ms": state.public_probe.last_ms} if state.public_probe is not None else None),
+                           **(state.host.view() if state.host is not None else {"disk": None, "memory": None}),
+                           "backup": state.backup.view() if state.backup is not None else None},
+                "auto_training": state.autotrain.view(time.time(), state.trained_at) if state.autotrain is not None else None,
                 "self_monitoring": state.selfmon.view() if state.selfmon is not None else None,
                 "telegram": ({"pending": state.telegram.pending, "sent": state.telegram.sent,
                               "dropped": state.telegram.dropped, "last_error": state.telegram.last_error}
