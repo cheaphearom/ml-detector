@@ -58,6 +58,9 @@ services:
       NOTIFY_RESOLVE_AFTER_S: ${NOTIFY_RESOLVE_AFTER_S:-60}
       NOTIFY_MIN_WINDOWS: ${NOTIFY_MIN_WINDOWS:-}
       NOTIFY_TIMEZONE: ${NOTIFY_TIMEZONE:-UTC}
+      # business alert: products that ran out of stock (one message per store and product per cooldown)
+      STOCK_ALERTS: ${STOCK_ALERTS:-on}
+      STOCK_ALERT_COOLDOWN_MIN: ${STOCK_ALERT_COOLDOWN_MIN:-60}
       # system checks: is the POS API there at all, and do its logs still arrive? (empty URL = no probe)
       POS_HEALTH_URL: ${POS_HEALTH_URL-http://api:3000/health}
       HEALTH_CHECK_INTERVAL_S: ${HEALTH_CHECK_INTERVAL_S:-30}
