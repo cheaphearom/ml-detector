@@ -57,6 +57,7 @@ from .profiles import get_profile
 from .models import (
     LIVE_METHODS, RULE_METHODS, IsolationForestDetector, PCADetector, RandomForestDetector, RuleBasedDetector,
 )
+from .business import StockOutWatch
 from .notify import IncidentNotifier, TelegramSender, _clock as notify_clock
 from .selfmon import SelfMonitor
 from .autotrain import AutoTrainer, IncidentLog, skipped_message, trained_message
@@ -137,6 +138,10 @@ class Settings:
     # 0 = the profile's notify_min_windows
     notify_min_windows: int = field(default_factory=lambda: int(os.environ.get("NOTIFY_MIN_WINDOWS") or "0"))
     notify_timezone: str = field(default_factory=lambda: os.environ.get("NOTIFY_TIMEZONE", "UTC").strip() or "UTC")
+    # business alerts (business.py): products that ran out of stock
+    stock_alerts: bool = field(default_factory=lambda: _env_bool("STOCK_ALERTS", True))
+    stock_alert_cooldown_min: float = field(
+        default_factory=lambda: float(os.environ.get("STOCK_ALERT_COOLDOWN_MIN") or "60"))
     telegram_api_url: str = field(default_factory=lambda: os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org"))
     cors_allow_origins: tuple[str, ...] = field(default_factory=lambda: tuple(
         o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()))
@@ -237,6 +242,9 @@ class DetectorState:
                                           self.profile.system_name, settings.notify_timezone,
                                           settings.notify_min_windows or self.profile.notify_min_windows)
                          if send is not None else None)
+        self.stock = StockOutWatch(send if settings.stock_alerts else None,
+                                   lambda epoch: notify_clock(epoch, settings.notify_timezone),
+                                   settings.stock_alert_cooldown_min * 60.0, self.profile.system_name)
 
     # -- persistence -------------------------------------------------------------------
     def model_path(self) -> Path:
@@ -399,6 +407,9 @@ class DetectorState:
         with self.lock:
             self.polls += 1
             if not new.empty:
+                sent = self.stock.saw(new)
+                if sent and self.selfmon is not None:
+                    self.selfmon.event("stock_out_alert", messages=sent)
                 self.buffer = new if self.buffer.empty else pd.concat([self.buffer, new], ignore_index=True)
                 self.buffer = self.buffer.sort_values("t", kind="stable")
                 horizon = float(self.buffer["t"].max()) - s.buffer_minutes * 60.0
@@ -788,6 +799,12 @@ def create_app(settings: Settings | None = None, send=None) -> FastAPI:
         with state.lock:
             items = list(state.alerts)[-limit:]
         return {"count": len(items), "alerts": list(reversed(items))}
+
+    @app.get("/stock-outs")
+    def stock_outs(limit: int = 50) -> dict:
+        """Business alerts: sales refused because a product ran out (newest first)."""
+        with state.lock:
+            return {"enabled": state.settings.stock_alerts, **state.stock.view(max(1, min(limit, 200)))}
 
     return app
 

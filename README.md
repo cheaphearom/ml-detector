@@ -69,6 +69,11 @@ Cloudflare Tunnel + Access), and set on the POS server `LOKI_PUSH_URL` (Alloy) a
 - **POS profile**: services `pos-api` and `pos-worker`; events `sale_completed`, `sale_failed`, `payment_failed`,
   `stock_negative`, `cash_mismatch`, `webhook_failed`, `webhook_retries_exhausted`, `login_failed`,
   `db_query_slow`; `sale_success_ratio` = completed / (completed + failed + failed payments).
+- **Stock-outs are business, not faults**: a sale refused with "Not enough stock for … (SKU-…)" becomes the event
+  `sale_out_of_stock`. Its lines (the WARNs, the 400 response, the product name in the message) stay out of the
+  service features, the success ratio and the never-seen messages; `stock_negative` still counts them. In the
+  thesis runs this removed most of PCA's false alarms in run 3 (false-alarm windows 34 → 12, precision 0.66 →
+  0.84) without missing a fault. The shop is told separately, see below.
 - **Rules** (no training needed; each must hold for 3 windows): `pos-api` 5xx above 5 % (≥ 10 requests), p95 above
   1500 ms, more than 5 ERROR lines in a service, more than 3 failed payments, any webhook given up.
 - **Isolation Forest and PCA** (reconstruction error and Hotelling's T² for the POS), trained on normal windows. The
@@ -113,6 +118,20 @@ The backup check arms itself on the first backup file it sees, so a wrong folder
 says "waiting for a first backup". Containers are not watched one by one (that would need the Docker socket, which
 gives full control of the server): the API probe covers the API, database and Redis; the public address the web
 app and the tunnel; the heartbeat the log shipping.
+
+## Out of stock (business alert)
+
+When a cashier cannot sell a product because the store has none left, Telegram gets one message per store:
+
+```
+🛒 Out of stock: Phnom Penh - Toul Kork (POS)
+Time: 2026-11-27 17:24:32 Asia/Phnom_Penh
+
+• Dish Soap 500ml (SKU-0022): 0 left, a customer wanted 2, 1 sale refused
+```
+
+The same product in the same store is reported again after `STOCK_ALERT_COOLDOWN_MIN` (60), with the number of
+sales refused in between. `GET /stock-outs` lists the recent ones. `STOCK_ALERTS=off` turns the messages off.
 
 ## The detector's own dashboard
 
@@ -180,6 +199,7 @@ If Telegram cannot be reached the detector logs a warning, keeps running and sen
 | `NOTIFY_RESOLVE_AFTER_S` | 60 | seconds without an alert before "resolved" |
 | `NOTIFY_MIN_WINDOWS` | profile (4) | windows in a row an ML detector must alert before a message |
 | `NOTIFY_TIMEZONE` | UTC | |
+| `STOCK_ALERTS`, `STOCK_ALERT_COOLDOWN_MIN` | `on`, 60 | "Out of stock" messages; minutes before the same product in a store is reported again |
 | `LOKI_QUERY` | `{job="pos"}` | LogQL stream selector of the system's logs |
 | `LOKI_DELAY_S` | 10 | read up to this many seconds ago (lines reach Loki a little later) |
 | `POS_HEALTH_URL` | `http://api:3000/health` | the API probe; empty = off |
@@ -202,6 +222,7 @@ Without Docker or without Loki, the detector also reads log files: `LOG_SOURCE=f
 | `GET /health` | status, profile, log source, models, last window, Telegram queue (no key needed) |
 | `GET /detect` | the newest window: every method's score, threshold and alert, key features, explanation |
 | `GET /alerts`, `GET /scores?minutes=30` | recent alerts; scores per window |
+| `GET /stock-outs` | recent sales refused for lack of stock, per store and product |
 | `POST /train` | `{"hours": 24}` or `{"start": "…", "end": "…"}` |
 | `POST /notify/test` | a test message to Telegram |
 | `POST /evaluate` | offline evaluation of labelled experiments (the thesis) |

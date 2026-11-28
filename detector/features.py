@@ -29,6 +29,7 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
+from .parsing import business_mask
 from .profiles import Profile, get_profile
 
 # The e-commerce defaults, kept for code that imports them (evaluation, synthetic logs).
@@ -114,8 +115,10 @@ def build_windows(logs: pd.DataFrame, window: float = 30.0, step: float = 10.0,
     out: dict[str, np.ndarray] = {"window_start": starts, "window_end": ends}
 
     logs = logs.sort_values("t", kind="stable")
+    # stock-outs are the shop's business, not a software fault: their lines stay out of the service features
+    technical = logs[~business_mask(logs)]
     for svc in services:
-        s = logs[logs["service"] == svc]
+        s = technical[technical["service"] == svc]
         t = s["t"].to_numpy(dtype=float)
         level = s["level"].to_numpy(dtype=object)
         n = _Counter(t).count(starts, ends)
@@ -217,7 +220,7 @@ def add_unseen_templates(windows: pd.DataFrame, logs: pd.DataFrame, known: Itera
     if windows.empty:
         return windows
     known = set(known)
-    mask = ~logs["template"].isin(known) & logs["level"].isin(UNSEEN_LEVELS)
+    mask = ~logs["template"].isin(known) & logs["level"].isin(UNSEEN_LEVELS) & ~business_mask(logs)
     unseen_t = logs.loc[mask, "t"].to_numpy(dtype=float)
     windows[col] = _Counter(unseen_t).count(windows["window_start"].to_numpy(),
                                             windows["window_end"].to_numpy())

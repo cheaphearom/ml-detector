@@ -25,7 +25,18 @@ import pandas as pd
 LOG_COLUMNS = [
     "ts", "t", "service", "level", "logger", "message", "template", "event",
     "method", "path", "status", "durationMs", "has_stack", "traceId", "store_id", "store_name",
+    "detail", "business",
 ]
+
+# A sale refused because the shelf is empty is a business event, not a technical fault. The POS API logs it as
+# sale_failed with reason "Not enough stock for Dish Soap 500ml (SKU-0022): available 0, needed 2"; it is renamed
+# to this event so it neither lowers the sale success ratio nor counts as a failed sale.
+STOCK_OUT_EVENT = "sale_out_of_stock"
+STOCK_OUT_REASON = re.compile(r"^Not enough stock for (?P<product>.+) \((?P<sku>[^()]*)\): "
+                              r"available (?P<available>-?[\d.]+), needed (?P<needed>-?[\d.]+)")
+# business events about stock: kept as events, but their WARN lines, their 4xx response and their changing
+# product names are left out of the technical features (see features.build_windows)
+STOCK_EVENTS = ("stock_negative", STOCK_OUT_EVENT)
 
 _MASKS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<UUID>"),
@@ -102,13 +113,17 @@ def records_to_frame(records: Iterable[dict], default_service: str | None = None
         if not ts:
             continue
         message = r.get("message", "")
+        event = r.get("event") or ""
+        detail = str(r.get("reason") or "")
+        if event == "sale_failed" and STOCK_OUT_REASON.match(detail):
+            event = STOCK_OUT_EVENT
         rows.append((
             ts,
             r.get("service") or default_service or "unknown",
             str(r.get("level", "INFO")).upper(),
             r.get("logger_name", ""),
             message,
-            r.get("event") or "",
+            event,
             r.get("method") or "",
             r.get("path") or "",
             _to_float(r.get("status")),
@@ -117,17 +132,36 @@ def records_to_frame(records: Iterable[dict], default_service: str | None = None
             r.get("traceId") or "",
             str(r.get("storeId") or ""),        # POS business events name the store
             str(r.get("storeName") or ""),
+            detail,
         ))
     if not rows:
         return empty_logs()
     df = pd.DataFrame(rows, columns=["ts", "service", "level", "logger", "message", "event",
                                      "method", "path", "status", "durationMs", "has_stack", "traceId",
-                                     "store_id", "store_name"])
+                                     "store_id", "store_name", "detail"])
     df["ts"] = pd.to_datetime(df["ts"], utc=True, format="ISO8601", errors="coerce")
     df = df.dropna(subset=["ts"])
     df["t"] = to_epoch_seconds(df["ts"])
     df["template"] = [make_template(m) for m in df["message"]]
+    df["business"] = business_mask(df)
     return df[LOG_COLUMNS].sort_values("t", kind="stable").reset_index(drop=True)
+
+
+def business_mask(logs: pd.DataFrame) -> np.ndarray:
+    """True for stock events and for the other lines of the same request (its HTTP 400 response).
+
+    These lines describe the shop (a product ran out), not the software, so the technical features skip them.
+    """
+    if logs.empty:
+        return np.zeros(0, dtype=bool)
+    own = logs["event"].isin(STOCK_EVENTS).to_numpy()
+    if "business" in logs.columns:
+        own |= logs["business"].fillna(False).to_numpy(dtype=bool)
+    # only refused requests pass the flag on: a sale that went through with "Stock below zero" keeps its response
+    refused = (logs["event"] == STOCK_OUT_EVENT) | (
+        (logs["event"] == "stock_negative") & logs["message"].astype(str).str.startswith("Not enough stock"))
+    traces = set(logs.loc[refused.to_numpy(), "traceId"]) - {""}
+    return own | logs["traceId"].isin(traces).to_numpy()
 
 
 _EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
@@ -144,6 +178,7 @@ def empty_logs() -> pd.DataFrame:
     for c in ("t", "status", "durationMs"):
         df[c] = df[c].astype("float64")
     df["has_stack"] = df["has_stack"].astype("bool")
+    df["business"] = df["business"].astype("bool")
     return df
 
 
